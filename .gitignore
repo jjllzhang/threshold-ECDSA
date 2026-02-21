@@ -1,0 +1,50 @@
+# Build directories
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+
+# CMake / CTest generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# C / C++ compilation artifacts
+*.o
+*.obj
+*.lo
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exe
+
+# Coverage / profiling outputs
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+*.coverage
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+gg2019_implementation_plan.md
+gg2019_threshold_ecdsa_full_impl_spec.md
