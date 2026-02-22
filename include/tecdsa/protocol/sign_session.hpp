@@ -71,6 +71,7 @@ struct SignSessionConfig {
   std::shared_ptr<PaillierProvider> local_paillier;
   Bytes msg32;
   bool strict_mode = true;
+  bool require_aux_param_proof = false;
 
   std::optional<Scalar> fixed_k_i;
   std::optional<Scalar> fixed_gamma_i;
@@ -220,6 +221,7 @@ class SignSession : public Session {
   ProofMetadata expected_aux_param_proof_profile_;
   std::shared_ptr<PaillierProvider> local_paillier_;
   bool strict_mode_ = true;
+  bool require_aux_param_proof_ = false;
 
   Scalar local_x_i_;
   ECPoint public_key_y_;

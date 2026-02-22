@@ -40,6 +40,7 @@ struct KeygenSessionConfig {
   uint32_t paillier_modulus_bits = 2048;
   uint32_t aux_rsa_modulus_bits = 2048;
   bool strict_mode = true;
+  bool require_aux_param_proof = false;
   ProofMetadata expected_square_free_proof_profile;
   ProofMetadata expected_aux_param_proof_profile;
   std::chrono::milliseconds timeout = std::chrono::seconds(30);
@@ -64,6 +65,7 @@ struct KeygenResult {
   ProofMetadata square_free_proof_profile;
   ProofMetadata aux_param_proof_profile;
   bool strict_mode = true;
+  bool require_aux_param_proof = false;
 };
 
 class KeygenSession : public Session {
@@ -126,6 +128,7 @@ class KeygenSession : public Session {
   uint32_t paillier_modulus_bits_ = 2048;
   uint32_t aux_rsa_modulus_bits_ = 2048;
   bool strict_mode_ = true;
+  bool require_aux_param_proof_ = false;
   ProofMetadata expected_square_free_proof_profile_;
   ProofMetadata expected_aux_param_proof_profile_;
   std::unordered_set<PartyIndex> peers_;

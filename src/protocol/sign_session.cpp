@@ -1217,6 +1217,7 @@ SignSession::SignSession(SignSessionConfig cfg)
       expected_aux_param_proof_profile_(std::move(cfg.aux_param_proof_profile)),
       local_paillier_(std::move(cfg.local_paillier)),
       strict_mode_(cfg.strict_mode),
+      require_aux_param_proof_(cfg.require_aux_param_proof),
       local_x_i_(cfg.x_i),
       public_key_y_(cfg.y),
       msg32_(std::move(cfg.msg32)),
@@ -1289,7 +1290,7 @@ SignSession::SignSession(SignSessionConfig cfg)
     const auto aux_pf_it = all_aux_param_proofs_.find(party);
     const bool has_aux_proof =
         aux_pf_it != all_aux_param_proofs_.end() && !aux_pf_it->second.blob.empty();
-    if (strict_mode_ && !has_aux_proof) {
+    if (strict_mode_ && require_aux_param_proof_ && !has_aux_proof) {
       throw std::invalid_argument("strict mode requires aux parameter proof for each participant");
     }
     if (has_aux_proof) {

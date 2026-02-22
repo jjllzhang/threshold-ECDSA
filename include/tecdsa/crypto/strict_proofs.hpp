@@ -19,6 +19,8 @@ enum class StrictProofScheme : uint32_t {
   kStrictAlgebraicV1 = 2,
   // Reserved for future strict external/cryptographic proofs.
   kStrictExternalV1 = 3,
+  // Reserved for the future GG2019/[21] square-free proof track.
+  kSquareFreeGmr98V1 = 4,
 };
 
 enum StrictProofCapability : uint32_t {
@@ -81,6 +83,9 @@ AuxRsaParams GenerateAuxRsaParams(uint32_t modulus_bits, PartyIndex party_id);
 SquareFreeProof BuildSquareFreeProof(
     const mpz_class& modulus_n,
     const StrictProofVerifierContext& context = {});
+SquareFreeProof BuildSquareFreeProofGmr98(
+    const mpz_class& modulus_n,
+    const StrictProofVerifierContext& context = {});
 SquareFreeProof BuildSquareFreeProofWeak(
     const mpz_class& modulus_n,
     const StrictProofVerifierContext& context = {});
@@ -90,6 +95,9 @@ SquareFreeProof BuildSquareFreeProofStrict(
 bool VerifySquareFreeProof(const mpz_class& modulus_n,
                            const SquareFreeProof& proof,
                            const StrictProofVerifierContext& context = {});
+bool VerifySquareFreeProofGmr98(const mpz_class& modulus_n,
+                                const SquareFreeProof& proof,
+                                const StrictProofVerifierContext& context = {});
 bool VerifySquareFreeProofWeak(const mpz_class& modulus_n,
                                const SquareFreeProof& proof,
                                const StrictProofVerifierContext& context = {});

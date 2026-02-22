@@ -121,8 +121,8 @@ ctest --test-dir build --output-on-failure
 - [x] KeyGen Feldman VSS、`X_i` Schnorr；Sign `Γ_i/A_i` Schnorr 与 Phase5B 关系证明。
 - [x] 附录 A（A.1/A.2/A.3）字段/范围/绑定与失败即中止。
 - [x] Phase5D 检查与 abort 规则、最终 ECDSA verify、严格输入校验。
-- [~] KeyGen `N` square-free proof（[21]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/SquareFreeDevDigest/v1` 开发版绑定证明，不是 [21] 完整构造。
-- [~] Aux 参数 `Ñ,h1,h2` 证明（[14]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/AuxParamDevDigest/v1` 开发版绑定证明，不是 [14]/可信 CRS 的完整构造。
+- [~] KeyGen `N` square-free proof（[21]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/SquareFreeStrictAlgebraic/v1`，不是 [21] 完整构造。
+- [~] Aux 参数 `Ñ,h1,h2` 证明（[14]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/AuxParamStrictAlgebraic/v1`，不是 [14]/可信 CRS 的完整构造。
 
 结论：当前仓库实现了 strict 工程门禁与大部分协议强制项，但尚未达到 full-spec [21]/[14] 口径的“完全 STRICT 合规”。
 

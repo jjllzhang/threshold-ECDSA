@@ -54,6 +54,7 @@ std::vector<std::unique_ptr<KeygenSession>> BuildSessions(uint32_t n,
     cfg.participants = participants;
     cfg.threshold = t;
     cfg.strict_mode = strict_mode;
+    cfg.require_aux_param_proof = strict_mode;
     cfg.timeout = std::chrono::seconds(10);
     sessions.push_back(std::make_unique<KeygenSession>(std::move(cfg)));
   }

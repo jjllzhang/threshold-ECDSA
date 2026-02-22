@@ -125,6 +125,8 @@ StrictProofScheme U32ToScheme(uint32_t raw) {
       return StrictProofScheme::kStrictAlgebraicV1;
     case static_cast<uint32_t>(StrictProofScheme::kStrictExternalV1):
       return StrictProofScheme::kStrictExternalV1;
+    case static_cast<uint32_t>(StrictProofScheme::kSquareFreeGmr98V1):
+      return StrictProofScheme::kSquareFreeGmr98V1;
     default:
       return StrictProofScheme::kUnknown;
   }
@@ -506,7 +508,8 @@ bool ValidateAuxRsaParams(const AuxRsaParams& params) {
 
 bool IsStrictProofScheme(StrictProofScheme scheme) {
   return scheme == StrictProofScheme::kStrictAlgebraicV1 ||
-         scheme == StrictProofScheme::kStrictExternalV1;
+         scheme == StrictProofScheme::kStrictExternalV1 ||
+         scheme == StrictProofScheme::kSquareFreeGmr98V1;
 }
 
 bool IsDevProofScheme(StrictProofScheme scheme) {
@@ -827,16 +830,29 @@ bool VerifySquareFreeProofStrict(const mpz_class& modulus_n,
   return lhs2 == rhs2;
 }
 
+SquareFreeProof BuildSquareFreeProofGmr98(const mpz_class& modulus_n,
+                                          const StrictProofVerifierContext& context) {
+  // Skeleton path: keep behavior stable until dedicated [21]/GMR98 prover is introduced.
+  return BuildSquareFreeProofStrict(modulus_n, context);
+}
+
+bool VerifySquareFreeProofGmr98(const mpz_class& modulus_n,
+                                const SquareFreeProof& proof,
+                                const StrictProofVerifierContext& context) {
+  // Skeleton path: keep behavior stable until dedicated [21]/GMR98 verifier is introduced.
+  return VerifySquareFreeProofStrict(modulus_n, proof, context);
+}
+
 SquareFreeProof BuildSquareFreeProof(const mpz_class& modulus_n,
                                      const StrictProofVerifierContext& context) {
-  return BuildSquareFreeProofStrict(modulus_n, context);
+  return BuildSquareFreeProofGmr98(modulus_n, context);
 }
 
 bool VerifySquareFreeProof(const mpz_class& modulus_n,
                            const SquareFreeProof& proof,
                            const StrictProofVerifierContext& context) {
   if (IsStrictProofScheme(proof.metadata.scheme)) {
-    return VerifySquareFreeProofStrict(modulus_n, proof, context);
+    return VerifySquareFreeProofGmr98(modulus_n, proof, context);
   }
   return VerifySquareFreeProofWeak(modulus_n, proof, context);
 }

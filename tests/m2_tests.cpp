@@ -271,6 +271,7 @@ void TestSignSessionSkeletonAndTimeout() {
         0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
     };
     cfg.strict_mode = true;
+    cfg.require_aux_param_proof = true;
     cfg.fixed_k_i = Scalar::FromUint64(fixed_k);
     cfg.fixed_gamma_i = Scalar::FromUint64(fixed_gamma);
     return cfg;
@@ -420,6 +421,7 @@ void TestSignSessionSkeletonAndTimeout() {
                                                       std::chrono::seconds(5),
                                                       paillier_1);
   dev_missing_proof_cfg.strict_mode = false;
+  dev_missing_proof_cfg.require_aux_param_proof = false;
   dev_missing_proof_cfg.all_square_free_proofs.clear();
   dev_missing_proof_cfg.all_aux_param_proofs.clear();
   SignSession dev_session(std::move(dev_missing_proof_cfg));
@@ -445,6 +447,7 @@ void TestKeygenStrictRejectsLegacyPhase1PayloadShape() {
   cfg1.participants = {1, 2, 3};
   cfg1.threshold = 1;
   cfg1.strict_mode = true;
+  cfg1.require_aux_param_proof = true;
   cfg1.timeout = std::chrono::seconds(5);
 
   KeygenSessionConfig cfg2 = cfg1;
@@ -478,6 +481,7 @@ void TestKeygenStrictRejectsTamperedAuxProof() {
   cfg1.participants = {1, 2, 3};
   cfg1.threshold = 1;
   cfg1.strict_mode = true;
+  cfg1.require_aux_param_proof = true;
   cfg1.timeout = std::chrono::seconds(5);
 
   KeygenSessionConfig cfg2 = cfg1;

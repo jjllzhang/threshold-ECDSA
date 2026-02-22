@@ -595,6 +595,7 @@ std::vector<std::unique_ptr<KeygenSession>> BuildKeygenSessions(const BenchArgs&
     cfg.paillier_modulus_bits = args.paillier_bits;
     cfg.timeout = std::chrono::seconds(30);
     cfg.strict_mode = true;
+    cfg.require_aux_param_proof = true;
     sessions.push_back(std::make_unique<KeygenSession>(std::move(cfg)));
   }
   return sessions;
@@ -748,6 +749,7 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     cfg.local_paillier = local_paillier_keys.at(self_id);
     cfg.msg32 = msg32;
     cfg.strict_mode = true;
+    cfg.require_aux_param_proof = baseline_it->second.require_aux_param_proof;
     sessions.push_back(std::make_unique<SignSession>(std::move(cfg)));
   }
 

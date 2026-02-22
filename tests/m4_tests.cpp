@@ -78,6 +78,8 @@ std::vector<std::unique_ptr<KeygenSession>> BuildKeygenSessions(uint32_t n,
     cfg.participants = participants;
     cfg.threshold = t;
     cfg.timeout = std::chrono::seconds(10);
+    cfg.strict_mode = true;
+    cfg.require_aux_param_proof = true;
     sessions.push_back(std::make_unique<KeygenSession>(std::move(cfg)));
   }
   return sessions;
@@ -284,6 +286,7 @@ std::vector<SignSessionConfig> BuildSignSessionConfigs(
     cfg.local_paillier = paillier_private.at(self_id);
     cfg.msg32 = fixture.msg32;
     cfg.strict_mode = baseline_it->second.strict_mode;
+    cfg.require_aux_param_proof = baseline_it->second.require_aux_param_proof;
     cfg.fixed_k_i = fixture.fixed_k.at(self_id);
     cfg.fixed_gamma_i = fixture.fixed_gamma.at(self_id);
 
