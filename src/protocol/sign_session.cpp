@@ -295,6 +295,15 @@ const mpz_class& QPow3() {
   return q_pow_3;
 }
 
+const mpz_class& QPow5() {
+  static const mpz_class q_pow_5 = []() {
+    mpz_class out;
+    mpz_pow_ui(out.get_mpz_t(), Scalar::ModulusQ().get_mpz_t(), 5);
+    return out;
+  }();
+  return q_pow_5;
+}
+
 const mpz_class& QPow7() {
   static const mpz_class q_pow_7 = []() {
     mpz_class out;
@@ -302,6 +311,15 @@ const mpz_class& QPow7() {
     return out;
   }();
   return q_pow_7;
+}
+
+const mpz_class& MinPaillierModulusQ8() {
+  static const mpz_class q_pow_8 = []() {
+    mpz_class out;
+    mpz_pow_ui(out.get_mpz_t(), Scalar::ModulusQ().get_mpz_t(), 8);
+    return out;
+  }();
+  return q_pow_8;
 }
 
 mpz_class NormalizeMod(const mpz_class& value, const mpz_class& modulus) {
@@ -1175,8 +1193,8 @@ SignSession::SignSession(SignSessionConfig cfg)
     if (paillier_it == all_paillier_public_.end()) {
       throw std::invalid_argument("all_paillier_public is missing participant key");
     }
-    if (paillier_it->second.n <= 1) {
-      throw std::invalid_argument("Paillier modulus must be > 1");
+    if (paillier_it->second.n <= MinPaillierModulusQ8()) {
+      throw std::invalid_argument("Paillier modulus must satisfy N > q^8");
     }
 
     const auto aux_it = all_aux_rsa_params_.find(party);
@@ -1755,7 +1773,7 @@ bool SignSession::HandlePhase2InitEnvelope(const Envelope& envelope) {
 
     const Scalar witness =
         (mta_type == MtaType::kTimesGamma) ? local_gamma_i_ : local_w_i_;
-    const mpz_class y = RandomBelow(Scalar::ModulusQ());
+    const mpz_class y = RandomBelow(QPow5());
     const mpz_class r_b = SampleZnStar(n);
     const mpz_class gamma = n + 1;
 

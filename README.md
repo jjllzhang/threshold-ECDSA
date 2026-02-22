@@ -7,7 +7,7 @@
 - 曲线与标量运算：基于 `libsecp256k1` 封装 `Scalar` / `ECPoint`
 - Paillier 同态加密：基于 `libhcs` 封装 `PaillierProvider`
 - 密码学基础组件：SHA-256/SHA-512、承诺、转录挑战、定长/变长编码
-- STRICT 证明模块：square-free/aux 参数证明接口与 strict/dev 门禁
+- STRICT 证明模块：square-free/aux 参数证明接口与 strict/dev 门禁（完整 [21]/[14] 严格证明仍在改造中）
 - 协议会话框架：统一 `Session` 生命周期（运行、完成、中止、超时）
 - 网络抽象：`ITransport` + `InMemoryTransport` + `SessionRouter`
 - 阈值密钥生成（Keygen）：3 阶段广播/点对点混合流程
@@ -32,7 +32,7 @@
   - Feldman share 校验
   - Schnorr 证明校验
   - Paillier 公钥约束 `N > q^8`
-  - Phase1 的 square-free/aux proof strict 校验
+  - Phase1 的 square-free/aux proof strict 门禁校验（当前为接口能力验证，不等同 full-spec [21]/[14] 严格证明）
   - 篡改消息触发中止
 - `m4_tests`：Sign 完整流程与故障路径
   - 端到端生成并验证 `(r,s)`
@@ -113,4 +113,5 @@ ctest --test-dir build --output-on-failure
 
 - 当前网络层仅有内存传输实现，未包含真实网络协议、鉴权、重传或持久化。
 - 代码主要面向研究与工程分层验证，未经过生产安全审计。
+- `STRICT_MODE` 的 full-spec 合规改造计划见 `full_spec_strict_commit_plan.md`。
 - 若用于真实系统，需要补齐传输安全、密钥托管、审计日志、对抗性测试与性能优化。

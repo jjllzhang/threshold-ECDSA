@@ -174,8 +174,8 @@ void TestSignSessionSkeletonAndTimeout() {
   all_x_i.emplace(2, tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(5)));
   const tecdsa::ECPoint y = tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(1));
 
-  auto paillier_1 = std::make_shared<tecdsa::PaillierProvider>(/*modulus_bits=*/1024);
-  auto paillier_2 = std::make_shared<tecdsa::PaillierProvider>(/*modulus_bits=*/1024);
+  auto paillier_1 = std::make_shared<tecdsa::PaillierProvider>(/*modulus_bits=*/2048);
+  auto paillier_2 = std::make_shared<tecdsa::PaillierProvider>(/*modulus_bits=*/2048);
   std::unordered_map<tecdsa::PartyIndex, PaillierPublicKey> paillier_public;
   paillier_public.emplace(1, PaillierPublicKey{.n = paillier_1->modulus_n()});
   paillier_public.emplace(2, PaillierPublicKey{.n = paillier_2->modulus_n()});
@@ -373,6 +373,17 @@ void TestSignSessionSkeletonAndTimeout() {
   SignSession dev_session(std::move(dev_missing_proof_cfg));
   Expect(dev_session.phase() == SignPhase::kPhase1,
          "dev mode sign session should allow missing strict proofs and stay runnable");
+
+  SignSessionConfig small_n_cfg = build_cfg(/*self_id=*/1,
+                                            /*x_i_value=*/3,
+                                            /*fixed_k=*/11,
+                                            /*fixed_gamma=*/22,
+                                            Bytes{6, 6, 6},
+                                            std::chrono::seconds(5),
+                                            paillier_1);
+  small_n_cfg.all_paillier_public[2].n = 17;
+  ExpectThrow([&]() { (void)SignSession(std::move(small_n_cfg)); },
+              "sign session must reject participant Paillier modulus not satisfying N > q^8");
 }
 
 void TestSessionIdAndRecipientMismatchRejected() {
