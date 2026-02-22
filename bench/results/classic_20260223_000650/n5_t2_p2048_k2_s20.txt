@@ -1,0 +1,41 @@
+case=n5_t2_p2048_k2_s20
+command=./build/protocol_flow_bench --n 5 --t 2 --paillier-bits 2048 --keygen-iters 2 --sign-iters 20
+timestamp=2026-02-23T00:07:43+08:00
+Protocol flow benchmark config: n=5, t=2, keygen_iters=2, sign_iters=20, paillier_bits=2048
+
+[Keygen]
+Phase                 Avg ms      Avg bytes
+phase1              1604.661          9165.0
+phase2                12.541          2200.0
+phase3              3406.668         32850.0
+
+[Sign]
+Phase                 Avg ms      Avg bytes
+phase1                 0.461           180.0
+phase2              1936.503         70048.4
+phase3                 0.046           180.0
+phase4                 4.937           486.0
+phase5A                1.834           180.0
+phase5B               12.839           876.0
+phase5C                1.596           180.0
+phase5D                1.333           390.0
+phase5E                0.964           180.0
+
+[Strict-Proof Attribution]
+Component                       Avg ms       Proof bytes   Proof bytes %
+keygen.phase1 aux             1604.661            6130.0            66.88
+keygen.phase3 square          3406.668           32220.0            98.08
+sign.phase2 A1/A2/A3          1936.503           56298.9            80.37
+sign.phase4 schnorr              4.937             195.0            40.12
+sign.phase5B proofs             12.839             486.0            55.48
+keygen strict subtotal        5011.329           38350.0            86.74
+sign strict subtotal          1954.279           56979.9            78.38
+
+[Strict-Proof Byte Detail]
+Component                       Avg bytes
+sign.phase2 A1                     21330.5
+sign.phase2 A2                     17583.2
+sign.phase2 A3                     17385.2
+sign.phase5B schnorr                 195.0
+sign.phase5B relation                291.0
+elapsed_sec=67.21

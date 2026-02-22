@@ -711,6 +711,6 @@ int main() {
     return 1;
   }
 
-  std::cout << "M3 tests passed" << '\n';
+  std::cout << "keygen_flow_tests passed" << '\n';
   return 0;
 }

@@ -274,6 +274,6 @@ int main() {
     return 1;
   }
 
-  std::cout << "M0 tests passed" << '\n';
+  std::cout << "crypto_primitives_tests passed" << '\n';
   return 0;
 }

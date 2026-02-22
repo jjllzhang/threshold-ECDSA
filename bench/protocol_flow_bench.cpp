@@ -1012,7 +1012,7 @@ void PrintStrictProofSummary(const StrictProofMetrics& strict_metrics,
 int main(int argc, char** argv) {
   try {
     const BenchArgs args = ParseArgs(argc, argv);
-    std::cout << "M9 benchmark config: n=" << args.n
+    std::cout << "Protocol flow benchmark config: n=" << args.n
               << ", t=" << args.t
               << ", keygen_iters=" << args.keygen_iters
               << ", sign_iters=" << args.sign_iters

@@ -1364,6 +1364,6 @@ int main() {
     return 1;
   }
 
-  std::cout << "M4/M5/M6/M7/M9 tests passed" << '\n';
+  std::cout << "sign_flow_tests passed" << '\n';
   return 0;
 }

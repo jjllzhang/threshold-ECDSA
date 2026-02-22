@@ -545,6 +545,6 @@ int main() {
     return 1;
   }
 
-  std::cout << "M2 tests passed" << '\n';
+  std::cout << "protocol_infrastructure_tests passed" << '\n';
   return 0;
 }

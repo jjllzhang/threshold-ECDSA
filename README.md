@@ -40,7 +40,7 @@
   - Phase5D 篡改导致失败
   - Phase2 instance id 不一致触发中止
   - Phase4/Phase5B 的 ZK proof 篡改触发中止
-  - M9 对抗场景：错 commitment / 错 `δ_i` / 错 `Γ_i` / 错 `V_i` 触发中止且无结果泄露
+  - 对抗场景：错 commitment / 错 `δ_i` / 错 `Γ_i` / 错 `V_i` 触发中止且无结果泄露
 
 ## 协议流程摘要
 
@@ -113,6 +113,33 @@ ctest --test-dir build --output-on-failure
 - Keygen/Sign 各 phase 的平均耗时与总带宽。
 - strict-proof 归因拆分（aux/square-free/A.1-A.3/Phase4 Schnorr/Phase5B 证明）的平均耗时与带宽。
 
+## 经典 Benchmark 结果（2026-02-23）
+
+已执行一组常见阈值配置，并将原始输出与汇总保存到：
+`bench/results/classic_20260223_000650`
+
+主要结果文件：
+- `bench/results/classic_20260223_000650/index.md`
+- `bench/results/classic_20260223_000650/summary.csv`
+- `bench/results/classic_20260223_000650/summary.md`
+
+配置与耗时摘要（elapsed wall-clock）：
+
+| case | n/t | paillier | keygen_iters | sign_iters | elapsed_sec | keygen_strict_ratio% | sign_strict_ratio% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| n2_t1_p2048_k3_s20 | 2/1 | 2048 | 3 | 20 | 24.55 | 88.88 | 76.52 |
+| n3_t1_p2048_k3_s20 | 3/1 | 2048 | 3 | 20 | 28.61 | 88.26 | 76.52 |
+| n5_t2_p2048_k2_s20 | 5/2 | 2048 | 2 | 20 | 67.21 | 86.74 | 78.38 |
+| n5_t2_p3072_k1_s10 | 5/2 | 3072 | 1 | 10 | 80.09 | 89.20 | 75.17 |
+
+复现这些结果可直接运行：
+
+```bash
+./build/protocol_flow_bench --n 2 --t 1 --paillier-bits 2048 --keygen-iters 3 --sign-iters 20
+./build/protocol_flow_bench --n 3 --t 1 --paillier-bits 2048 --keygen-iters 3 --sign-iters 20
+./build/protocol_flow_bench --n 5 --t 2 --paillier-bits 2048 --keygen-iters 2 --sign-iters 20
+./build/protocol_flow_bench --n 5 --t 2 --paillier-bits 3072 --keygen-iters 1 --sign-iters 10
+```
 
 ## 使用边界与注意事项
 
