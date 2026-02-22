@@ -1279,7 +1279,7 @@ SignSession::SignSession(SignSessionConfig cfg)
         if (!StrictMetadataCompatible(expected_square_free_proof_profile_, square_it->second.metadata)) {
           throw std::invalid_argument("square-free proof metadata is not compatible with strict profile");
         }
-        if (!VerifySquareFreeProofStrict(paillier_it->second.n, square_it->second, context)) {
+        if (!VerifySquareFreeProofGmr98(paillier_it->second.n, square_it->second, context)) {
           throw std::invalid_argument("square-free proof verification failed");
         }
       } else if (!VerifySquareFreeProof(paillier_it->second.n, square_it->second, context)) {

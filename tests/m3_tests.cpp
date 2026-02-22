@@ -361,6 +361,8 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
         Expect(square_it != current.all_square_free_proofs.end(),
                "Strict keygen result must include square-free proof for party " +
                    std::to_string(party_id));
+        Expect(square_it->second.metadata.scheme == tecdsa::StrictProofScheme::kSquareFreeGmr98V1,
+               "Strict keygen result must use GMR98 square-free proof scheme");
         Expect(aux_pf_it != current.all_aux_param_proofs.end(),
                "Strict keygen result must include aux param proof for party " +
                    std::to_string(party_id));

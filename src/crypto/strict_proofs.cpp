@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/crypto/hash.hpp"
@@ -21,20 +22,26 @@ namespace {
 constexpr char kSquareFreeProofIdWeak[] = "GG2019/SquareFreeDevDigest/v2";
 constexpr char kAuxParamProofIdWeak[] = "GG2019/AuxParamDevDigest/v2";
 constexpr char kSquareFreeProofIdStrict[] = "GG2019/SquareFreeStrictAlgebraic/v1";
+constexpr char kSquareFreeProofIdGmr98[] = "GG2019/SquareFreeGMR98/v1";
 constexpr char kAuxParamProofIdStrict[] = "GG2019/AuxParamStrictAlgebraic/v1";
 constexpr char kSquareFreeSchemeIdWeak[] = "GG2019/DevDigestBinding/SquareFree/v2";
 constexpr char kAuxParamSchemeIdWeak[] = "GG2019/DevDigestBinding/AuxParam/v2";
 constexpr char kSquareFreeSchemeIdStrict[] = "GG2019/StrictAlgebraic/SquareFree/v1";
+constexpr char kSquareFreeSchemeIdGmr98[] = "GG2019/GMR98/SquareFree/v1";
 constexpr char kAuxParamSchemeIdStrict[] = "GG2019/StrictAlgebraic/AuxParam/v1";
 
 constexpr uint32_t kProofWireMagicV1 = 0x53505231;  // "SPR1"
 constexpr uint32_t kProofWireMagicV2 = 0x53505232;  // "SPR2"
 constexpr uint32_t kDevProofVersion = 1;
 constexpr uint32_t kStrictAlgebraicVersion = 1;
+constexpr uint32_t kSquareFreeGmr98Version = 1;
 constexpr size_t kMaxSchemeIdLen = 256;
 constexpr size_t kStrictNonceLen = 32;
 constexpr size_t kMaxStrictNonceLen = 256;
 constexpr size_t kMaxStrictFieldLen = 8192;
+constexpr size_t kSquareFreeGmr98Rounds = 24;
+constexpr size_t kMaxSquareFreeGmr98Rounds = 128;
+constexpr size_t kMaxSquareFreeGmr98ChallengeAttempts = 64;
 constexpr size_t kMaxAuxParamGenerationAttempts = 128;
 
 struct SquareFreeStrictPayload {
@@ -44,6 +51,12 @@ struct SquareFreeStrictPayload {
   mpz_class t2;
   mpz_class z1;
   mpz_class z2;
+};
+
+struct SquareFreeGmr98Payload {
+  Bytes nonce;
+  uint32_t rounds = 0;
+  std::vector<mpz_class> roots;
 };
 
 struct AuxParamStrictPayload {
@@ -159,6 +172,24 @@ ProofMetadata MakeStrictMetadata(const char* scheme_id, const StrictProofVerifie
       .version = kStrictAlgebraicVersion,
       .capability_flags = capability_flags,
       .scheme_id = scheme_id,
+  };
+}
+
+ProofMetadata MakeSquareFreeGmr98Metadata(const StrictProofVerifierContext& context) {
+  uint32_t capability_flags =
+      kProofCapabilityStrictReady |
+      kProofCapabilityAlgebraicChecks |
+      kProofCapabilityFreshRandomness |
+      kProofCapabilityHeuristicChecks;
+  if (HasContextBinding(context)) {
+    capability_flags |= kProofCapabilityContextBinding;
+  }
+
+  return ProofMetadata{
+      .scheme = StrictProofScheme::kSquareFreeGmr98V1,
+      .version = kSquareFreeGmr98Version,
+      .capability_flags = capability_flags,
+      .scheme_id = kSquareFreeSchemeIdGmr98,
   };
 }
 
@@ -333,6 +364,17 @@ mpz_class PowMod(const mpz_class& base, const mpz_class& exp, const mpz_class& m
   return out;
 }
 
+std::optional<mpz_class> InvertMod(const mpz_class& value, const mpz_class& modulus) {
+  if (modulus <= 1) {
+    return std::nullopt;
+  }
+  mpz_class inverse;
+  if (mpz_invert(inverse.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t()) == 0) {
+    return std::nullopt;
+  }
+  return inverse;
+}
+
 Bytes BuildWeakDigest(const char* proof_id,
                       const StrictProofVerifierContext& context,
                       const std::array<std::pair<const char*, Bytes>, 1>& fields) {
@@ -410,6 +452,68 @@ Scalar BuildAuxParamStrictChallenge(const AuxRsaParams& params,
   return transcript.challenge_scalar_mod_q();
 }
 
+Bytes ExpandHashStream(std::span<const uint8_t> seed, size_t out_len) {
+  if (out_len == 0) {
+    return {};
+  }
+
+  Bytes out;
+  out.reserve(out_len);
+  uint32_t block = 0;
+  while (out.size() < out_len) {
+    Bytes block_input(seed.begin(), seed.end());
+    AppendU32Be(block, &block_input);
+    const Bytes digest = Sha256(block_input);
+    const size_t remaining = out_len - out.size();
+    const size_t take = std::min(remaining, digest.size());
+    out.insert(out.end(), digest.begin(), digest.begin() + static_cast<std::ptrdiff_t>(take));
+    ++block;
+  }
+  return out;
+}
+
+mpz_class DeriveSquareFreeGmr98Challenge(const mpz_class& modulus_n,
+                                         const StrictProofVerifierContext& context,
+                                         std::span<const uint8_t> nonce,
+                                         uint32_t round_idx) {
+  if (modulus_n <= 3) {
+    throw std::invalid_argument("square-free GMR98 challenge requires modulus N > 3");
+  }
+
+  const Bytes n_bytes = EncodeMpz(modulus_n);
+  const size_t byte_len =
+      std::max<size_t>(1, (mpz_sizeinbase(modulus_n.get_mpz_t(), 2) + 7) / 8);
+
+  for (uint32_t attempt = 0; attempt < kMaxSquareFreeGmr98ChallengeAttempts; ++attempt) {
+    Transcript transcript;
+    transcript.append_proof_id(kSquareFreeProofIdGmr98);
+    AppendVerifierContext(&transcript, context);
+    transcript.append_fields({
+        TranscriptFieldRef{.label = "N", .data = n_bytes},
+        TranscriptFieldRef{.label = "nonce", .data = nonce},
+    });
+    transcript.append_u32_be("round", round_idx);
+    transcript.append_u32_be("attempt", attempt);
+
+    const Bytes seed = Sha256(transcript.bytes());
+    const Bytes expanded = ExpandHashStream(seed, byte_len);
+    mpz_class candidate;
+    mpz_import(candidate.get_mpz_t(),
+               expanded.size(),
+               1,
+               sizeof(uint8_t),
+               1,
+               0,
+               expanded.data());
+    candidate %= modulus_n;
+    if (IsZnStarElementMod(candidate, modulus_n)) {
+      return candidate;
+    }
+  }
+
+  throw std::runtime_error("failed to derive square-free GMR98 challenge in Z*_N");
+}
+
 Bytes EncodeSquareFreeStrictPayload(const SquareFreeStrictPayload& payload) {
   Bytes out;
   AppendSizedField(payload.nonce, &out);
@@ -432,6 +536,41 @@ SquareFreeStrictPayload DecodeSquareFreeStrictPayload(std::span<const uint8_t> b
   payload.z2 = ReadMpzField(blob, &offset, "square-free z2");
   if (offset != blob.size()) {
     throw std::invalid_argument("square-free proof payload has trailing bytes");
+  }
+  return payload;
+}
+
+Bytes EncodeSquareFreeGmr98Payload(const SquareFreeGmr98Payload& payload) {
+  if (payload.rounds == 0 || payload.rounds > kMaxSquareFreeGmr98Rounds) {
+    throw std::invalid_argument("square-free GMR98 rounds out of range");
+  }
+  if (payload.roots.size() != payload.rounds) {
+    throw std::invalid_argument("square-free GMR98 roots count mismatch");
+  }
+
+  Bytes out;
+  AppendSizedField(payload.nonce, &out);
+  AppendU32Be(payload.rounds, &out);
+  for (const mpz_class& root : payload.roots) {
+    AppendMpzField(root, &out);
+  }
+  return out;
+}
+
+SquareFreeGmr98Payload DecodeSquareFreeGmr98Payload(std::span<const uint8_t> blob) {
+  size_t offset = 0;
+  SquareFreeGmr98Payload payload;
+  payload.nonce = ReadSizedField(blob, &offset, kMaxStrictNonceLen, "square-free GMR98 nonce");
+  payload.rounds = ReadU32Be(blob, &offset);
+  if (payload.rounds == 0 || payload.rounds > kMaxSquareFreeGmr98Rounds) {
+    throw std::invalid_argument("square-free GMR98 rounds out of range");
+  }
+  payload.roots.reserve(payload.rounds);
+  for (uint32_t i = 0; i < payload.rounds; ++i) {
+    payload.roots.push_back(ReadMpzField(blob, &offset, "square-free GMR98 root"));
+  }
+  if (offset != blob.size()) {
+    throw std::invalid_argument("square-free GMR98 payload has trailing bytes");
   }
   return payload;
 }
@@ -831,16 +970,119 @@ bool VerifySquareFreeProofStrict(const mpz_class& modulus_n,
 }
 
 SquareFreeProof BuildSquareFreeProofGmr98(const mpz_class& modulus_n,
+                                          const mpz_class& lambda_n,
                                           const StrictProofVerifierContext& context) {
-  // Skeleton path: keep behavior stable until dedicated [21]/GMR98 prover is introduced.
+  if (modulus_n <= 3) {
+    throw std::invalid_argument("square-free GMR98 proof requires modulus N > 3");
+  }
+  if (lambda_n <= 1) {
+    throw std::invalid_argument("square-free GMR98 proof requires lambda(N) > 1");
+  }
+  if (!IsLikelySquareFreeModulus(modulus_n)) {
+    throw std::invalid_argument("square-free GMR98 proof requires likely square-free modulus");
+  }
+
+  const auto d_opt = InvertMod(NormalizeMod(modulus_n, lambda_n), lambda_n);
+  if (!d_opt.has_value()) {
+    throw std::invalid_argument("square-free GMR98 proof requires gcd(N, lambda(N)) = 1");
+  }
+  const mpz_class d = *d_opt;
+  const Bytes nonce = Csprng::RandomBytes(kStrictNonceLen);
+
+  SquareFreeGmr98Payload payload;
+  payload.nonce = nonce;
+  payload.rounds = static_cast<uint32_t>(kSquareFreeGmr98Rounds);
+  payload.roots.reserve(payload.rounds);
+
+  for (uint32_t round = 0; round < payload.rounds; ++round) {
+    const mpz_class challenge = DeriveSquareFreeGmr98Challenge(modulus_n, context, nonce, round);
+    const mpz_class root = PowMod(challenge, d, modulus_n);
+    if (!IsZnStarElementMod(root, modulus_n)) {
+      throw std::runtime_error("square-free GMR98 proof generated invalid root");
+    }
+    const mpz_class check = PowMod(root, modulus_n, modulus_n);
+    if (check != challenge) {
+      throw std::runtime_error("square-free GMR98 proof generated inconsistent root equation");
+    }
+    payload.roots.push_back(root);
+  }
+
+  SquareFreeProof proof;
+  proof.metadata = MakeSquareFreeGmr98Metadata(context);
+  proof.blob = EncodeSquareFreeGmr98Payload(payload);
+  return proof;
+}
+
+SquareFreeProof BuildSquareFreeProofGmr98(const mpz_class& modulus_n,
+                                          const StrictProofVerifierContext& context) {
+  // Witness-less fallback retained for compatibility with callers that only have public N.
   return BuildSquareFreeProofStrict(modulus_n, context);
 }
 
 bool VerifySquareFreeProofGmr98(const mpz_class& modulus_n,
                                 const SquareFreeProof& proof,
                                 const StrictProofVerifierContext& context) {
-  // Skeleton path: keep behavior stable until dedicated [21]/GMR98 verifier is introduced.
-  return VerifySquareFreeProofStrict(modulus_n, proof, context);
+  if (proof.metadata.scheme == StrictProofScheme::kStrictAlgebraicV1) {
+    return VerifySquareFreeProofStrict(modulus_n, proof, context);
+  }
+
+  if (!IsLikelySquareFreeModulus(modulus_n)) {
+    return false;
+  }
+  if (proof.blob.empty()) {
+    return false;
+  }
+  if (proof.metadata.scheme != StrictProofScheme::kSquareFreeGmr98V1) {
+    return false;
+  }
+  if (proof.metadata.version != kSquareFreeGmr98Version) {
+    return false;
+  }
+  if (!proof.metadata.scheme_id.empty() && proof.metadata.scheme_id != kSquareFreeSchemeIdGmr98) {
+    return false;
+  }
+  if (!HasProofCapability(
+          proof.metadata,
+          kProofCapabilityStrictReady |
+              kProofCapabilityAlgebraicChecks |
+              kProofCapabilityFreshRandomness |
+              kProofCapabilityHeuristicChecks)) {
+    return false;
+  }
+  if (HasContextBinding(context) &&
+      !HasProofCapability(proof.metadata, kProofCapabilityContextBinding)) {
+    return false;
+  }
+
+  SquareFreeGmr98Payload payload;
+  try {
+    payload = DecodeSquareFreeGmr98Payload(proof.blob);
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (payload.nonce.size() != kStrictNonceLen) {
+    return false;
+  }
+  if (payload.rounds != kSquareFreeGmr98Rounds) {
+    return false;
+  }
+  if (payload.roots.size() != payload.rounds) {
+    return false;
+  }
+
+  for (uint32_t round = 0; round < payload.rounds; ++round) {
+    const mpz_class& root = payload.roots[round];
+    if (!IsZnStarElementMod(root, modulus_n)) {
+      return false;
+    }
+    const mpz_class challenge =
+        DeriveSquareFreeGmr98Challenge(modulus_n, context, payload.nonce, round);
+    const mpz_class lhs = PowMod(root, modulus_n, modulus_n);
+    if (lhs != challenge) {
+      return false;
+    }
+  }
+  return true;
 }
 
 SquareFreeProof BuildSquareFreeProof(const mpz_class& modulus_n,

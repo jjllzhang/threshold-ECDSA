@@ -86,6 +86,10 @@ SquareFreeProof BuildSquareFreeProof(
 SquareFreeProof BuildSquareFreeProofGmr98(
     const mpz_class& modulus_n,
     const StrictProofVerifierContext& context = {});
+SquareFreeProof BuildSquareFreeProofGmr98(
+    const mpz_class& modulus_n,
+    const mpz_class& lambda_n,
+    const StrictProofVerifierContext& context = {});
 SquareFreeProof BuildSquareFreeProofWeak(
     const mpz_class& modulus_n,
     const StrictProofVerifierContext& context = {});

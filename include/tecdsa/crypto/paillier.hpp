@@ -46,6 +46,7 @@ class PaillierProvider {
   mpz_class modulus_n() const;
   mpz_class modulus_n2() const;
   mpz_class generator() const;
+  mpz_class private_lambda() const;
 
  private:
   mpz_class SampleZnStar() const;

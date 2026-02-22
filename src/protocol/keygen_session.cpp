@@ -22,8 +22,8 @@ constexpr size_t kPointCompressedLen = 33;
 constexpr size_t kScalarLen = 32;
 constexpr size_t kMaxOpenRandomnessLen = 1024;
 constexpr size_t kMaxPaillierModulusFieldLen = 8192;
-constexpr size_t kMaxProofBlobLen = 4096;
-constexpr size_t kMaxProofFieldLen = 8192;
+constexpr size_t kMaxProofBlobLen = 16384;
+constexpr size_t kMaxProofFieldLen = 16384;
 constexpr uint32_t kMinPaillierKeygenBits = 2048;
 constexpr uint32_t kMinAuxRsaKeygenBits = 2048;
 constexpr size_t kMaxPaillierKeygenAttempts = 32;
@@ -719,7 +719,9 @@ void KeygenSession::EnsureLocalStrictProofArtifactsPrepared() {
 
   const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), self_id());
   local_aux_rsa_params_ = GenerateAuxRsaParams(aux_rsa_modulus_bits_, self_id());
-  local_square_free_proof_ = BuildSquareFreeProofGmr98(local_paillier_public_.n, context);
+  local_square_free_proof_ = BuildSquareFreeProofGmr98(local_paillier_public_.n,
+                                                        local_paillier_->private_lambda(),
+                                                        context);
   if (require_aux_param_proof_) {
     local_aux_param_proof_ = BuildAuxRsaParamProof(local_aux_rsa_params_, context);
   } else {

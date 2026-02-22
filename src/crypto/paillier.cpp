@@ -132,6 +132,13 @@ mpz_class PaillierProvider::generator() const {
   return mpz_class(pk_->g);
 }
 
+mpz_class PaillierProvider::private_lambda() const {
+  if (sk_ == nullptr) {
+    throw std::logic_error("Paillier private key is not initialized");
+  }
+  return mpz_class(sk_->lambda);
+}
+
 mpz_class PaillierProvider::SampleZnStar() const {
   const mpz_class n = modulus_n();
 
