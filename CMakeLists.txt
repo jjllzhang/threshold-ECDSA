@@ -29,7 +29,7 @@ set_target_properties(hcs_vendor PROPERTIES
   C_STANDARD_REQUIRED ON
 )
 
-add_library(tecdsa_m0
+add_library(tecdsa_core
   src/crypto/scalar.cpp
   src/crypto/ec_point.cpp
   src/crypto/hash.cpp
@@ -47,32 +47,34 @@ add_library(tecdsa_m0
   src/protocol/sign_session.cpp
 )
 
-target_include_directories(tecdsa_m0 PUBLIC include)
+target_include_directories(tecdsa_core PUBLIC include)
 
-target_link_libraries(tecdsa_m0 PUBLIC gmpxx gmp hcs_vendor secp256k1)
+target_link_libraries(tecdsa_core PUBLIC gmpxx gmp hcs_vendor secp256k1)
 if(OpenSSL_FOUND)
-  target_link_libraries(tecdsa_m0 PUBLIC OpenSSL::Crypto)
+  target_link_libraries(tecdsa_core PUBLIC OpenSSL::Crypto)
 else()
-  target_link_libraries(tecdsa_m0 PUBLIC crypto)
+  target_link_libraries(tecdsa_core PUBLIC crypto)
 endif()
 
-add_executable(m0_tests tests/m0_tests.cpp)
-target_link_libraries(m0_tests PRIVATE tecdsa_m0)
+add_library(tecdsa_m0 ALIAS tecdsa_core)
 
-add_executable(m2_tests tests/m2_tests.cpp)
-target_link_libraries(m2_tests PRIVATE tecdsa_m0)
+add_executable(crypto_primitives_tests tests/crypto_primitives_tests.cpp)
+target_link_libraries(crypto_primitives_tests PRIVATE tecdsa_core)
 
-add_executable(m3_tests tests/m3_tests.cpp)
-target_link_libraries(m3_tests PRIVATE tecdsa_m0)
+add_executable(protocol_infrastructure_tests tests/protocol_infrastructure_tests.cpp)
+target_link_libraries(protocol_infrastructure_tests PRIVATE tecdsa_core)
 
-add_executable(m4_tests tests/m4_tests.cpp)
-target_link_libraries(m4_tests PRIVATE tecdsa_m0)
+add_executable(keygen_flow_tests tests/keygen_flow_tests.cpp)
+target_link_libraries(keygen_flow_tests PRIVATE tecdsa_core)
 
-add_executable(m9_bench bench/m9_bench.cpp)
-target_link_libraries(m9_bench PRIVATE tecdsa_m0)
+add_executable(sign_flow_tests tests/sign_flow_tests.cpp)
+target_link_libraries(sign_flow_tests PRIVATE tecdsa_core)
+
+add_executable(protocol_flow_bench bench/protocol_flow_bench.cpp)
+target_link_libraries(protocol_flow_bench PRIVATE tecdsa_core)
 
 enable_testing()
-add_test(NAME m0_tests COMMAND m0_tests)
-add_test(NAME m2_tests COMMAND m2_tests)
-add_test(NAME m3_tests COMMAND m3_tests)
-add_test(NAME m4_tests COMMAND m4_tests)
+add_test(NAME crypto_primitives_tests COMMAND crypto_primitives_tests)
+add_test(NAME protocol_infrastructure_tests COMMAND protocol_infrastructure_tests)
+add_test(NAME keygen_flow_tests COMMAND keygen_flow_tests)
+add_test(NAME sign_flow_tests COMMAND sign_flow_tests)

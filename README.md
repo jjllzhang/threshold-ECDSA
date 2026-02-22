@@ -7,7 +7,7 @@
 - 曲线与标量运算：基于 `libsecp256k1` 封装 `Scalar` / `ECPoint`
 - Paillier 同态加密：基于 `libhcs` 封装 `PaillierProvider`
 - 密码学基础组件：SHA-256/SHA-512、承诺、转录挑战、定长/变长编码
-- STRICT 证明模块：square-free/aux 参数证明接口与 strict/dev 门禁（完整 [21]/[14] 严格证明仍在改造中）
+- STRICT 证明模块：square-free/aux 参数证明接口与 strict/dev 门禁
 - 协议会话框架：统一 `Session` 生命周期（运行、完成、中止、超时）
 - 网络抽象：`ITransport` + `InMemoryTransport` + `SessionRouter`
 - 阈值密钥生成（Keygen）：3 阶段广播/点对点混合流程
@@ -16,25 +16,25 @@
 
 ## 当前实现进度（按测试里程碑）
 
-- `m0_tests`：基础密码学与编码组件
+- `crypto_primitives_tests`：基础密码学与编码组件
   - 大整数/标量/点编码
   - 点运算一致性
   - 哈希、承诺、随机数
   - Envelope 编解码
   - Paillier 加解密与同态性质
-- `m2_tests`：协议框架与网络骨架
+- `protocol_infrastructure_tests`：协议框架与网络骨架
   - In-memory 传输
   - SessionRouter 过滤与分发
   - Keygen/Sign 骨架推进与超时处理
   - strict/dev 缺 proof 行为分流
-- `m3_tests`：Keygen 完整流程
+- `keygen_flow_tests`：Keygen 完整流程
   - `n=3,t=1` 与 `n=5,t=2` 一致性
   - Feldman share 校验
   - Schnorr 证明校验
   - Paillier 公钥约束 `N > q^8`
-  - Phase1 的 square-free/aux proof strict 门禁校验（当前为接口能力验证，不等同 full-spec [21]/[14] 严格证明）
+  - Phase1 的 square-free/aux proof strict 门禁校验
   - 篡改消息触发中止
-- `m4_tests`：Sign 完整流程与故障路径
+- `sign_flow_tests`：Sign 完整流程与故障路径
   - 端到端生成并验证 `(r,s)`
   - Phase2 附录 A 证明（A.1/A.2/A.3）校验
   - Phase5D 篡改导致失败
@@ -71,10 +71,10 @@ src/
   net/
   protocol/
 tests/
-  m0_tests.cpp
-  m2_tests.cpp
-  m3_tests.cpp
-  m4_tests.cpp
+  crypto_primitives_tests.cpp
+  protocol_infrastructure_tests.cpp
+  keygen_flow_tests.cpp
+  sign_flow_tests.cpp
 third_party/
   secp256k1/
   libhcs/
@@ -102,33 +102,20 @@ ctest --test-dir build --output-on-failure
 也可以直接运行单项测试：
 
 ```bash
-./build/m0_tests
-./build/m2_tests
-./build/m3_tests
-./build/m4_tests
-./build/m9_bench --n 5 --t 2 --keygen-iters 1 --sign-iters 20
+./build/crypto_primitives_tests
+./build/protocol_infrastructure_tests
+./build/keygen_flow_tests
+./build/sign_flow_tests
+./build/protocol_flow_bench --n 5 --t 2 --keygen-iters 1 --sign-iters 20
 ```
 
-`m9_bench` 输出包含两类统计：
+`protocol_flow_bench` 输出包含两类统计：
 - Keygen/Sign 各 phase 的平均耗时与总带宽。
 - strict-proof 归因拆分（aux/square-free/A.1-A.3/Phase4 Schnorr/Phase5B 证明）的平均耗时与带宽。
 
-## Full-Spec STRICT 状态（2026-02-22）
-
-对照 `gg2019_threshold_ecdsa_full_impl_spec.md` 的 Part C.1（必须项）：
-
-- [x] secp256k1 点/标量运算、Paillier Enc/Dec+同态、`N > q^8` 检查。
-- [x] KeyGen Feldman VSS、`X_i` Schnorr；Sign `Γ_i/A_i` Schnorr 与 Phase5B 关系证明。
-- [x] 附录 A（A.1/A.2/A.3）字段/范围/绑定与失败即中止。
-- [x] Phase5D 检查与 abort 规则、最终 ECDSA verify、严格输入校验。
-- [~] KeyGen `N` square-free proof（[21]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/SquareFreeStrictAlgebraic/v1`，不是 [21] 完整构造。
-- [~] Aux 参数 `Ñ,h1,h2` 证明（[14]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/AuxParamStrictAlgebraic/v1`，不是 [14]/可信 CRS 的完整构造。
-
-结论：当前仓库实现了 strict 工程门禁与大部分协议强制项，但尚未达到 full-spec [21]/[14] 口径的“完全 STRICT 合规”。
 
 ## 使用边界与注意事项
 
 - 当前网络层仅有内存传输实现，未包含真实网络协议、鉴权、重传或持久化。
 - 代码主要面向研究与工程分层验证，未经过生产安全审计。
-- `STRICT_MODE` 的 full-spec 合规改造计划见 `full_spec_strict_commit_plan.md`。
 - 若用于真实系统，需要补齐传输安全、密钥托管、审计日志、对抗性测试与性能优化。

@@ -124,11 +124,11 @@ mpz_class ReadMpzField(std::span<const uint8_t> input, size_t* offset, const cha
   return DecodeMpz(encoded, kMaxStrictFieldLen);
 }
 
-uint32_t SchemeToU32(StrictProofScheme scheme) {
+uint32_t EncodeStrictProofScheme(StrictProofScheme scheme) {
   return static_cast<uint32_t>(scheme);
 }
 
-StrictProofScheme U32ToScheme(uint32_t raw) {
+StrictProofScheme DecodeStrictProofScheme(uint32_t raw) {
   switch (raw) {
     case static_cast<uint32_t>(StrictProofScheme::kUnknown):
       return StrictProofScheme::kUnknown;
@@ -224,7 +224,7 @@ Bytes EncodeProofWire(const ProofMetadata& metadata, std::span<const uint8_t> bl
   Bytes out;
   out.reserve(24 + metadata.scheme_id.size() + blob.size());
   AppendU32Be(kProofWireMagicV2, &out);
-  AppendU32Be(SchemeToU32(metadata.scheme), &out);
+  AppendU32Be(EncodeStrictProofScheme(metadata.scheme), &out);
   AppendU32Be(metadata.version, &out);
   AppendU32Be(metadata.capability_flags, &out);
   AppendU32Be(static_cast<uint32_t>(metadata.scheme_id.size()), &out);
@@ -244,7 +244,7 @@ std::pair<ProofMetadata, Bytes> DecodeProofWire(std::span<const uint8_t> encoded
     const uint32_t magic = ReadU32Be(encoded, &offset);
     if (magic == kProofWireMagicV2) {
       ProofMetadata metadata;
-      metadata.scheme = U32ToScheme(ReadU32Be(encoded, &offset));
+      metadata.scheme = DecodeStrictProofScheme(ReadU32Be(encoded, &offset));
       metadata.version = ReadU32Be(encoded, &offset);
       metadata.capability_flags = ReadU32Be(encoded, &offset);
       const uint32_t scheme_id_len = ReadU32Be(encoded, &offset);
@@ -276,7 +276,7 @@ std::pair<ProofMetadata, Bytes> DecodeProofWire(std::span<const uint8_t> encoded
     const uint32_t magic = ReadU32Be(encoded, &offset);
     if (magic == kProofWireMagicV1) {
       ProofMetadata metadata;
-      metadata.scheme = U32ToScheme(ReadU32Be(encoded, &offset));
+      metadata.scheme = DecodeStrictProofScheme(ReadU32Be(encoded, &offset));
       metadata.version = ReadU32Be(encoded, &offset);
       metadata.capability_flags = kProofCapabilityNone;
       const uint32_t blob_len = ReadU32Be(encoded, &offset);
@@ -334,7 +334,7 @@ bool IsInRange(const mpz_class& value, const mpz_class& modulus) {
   return value >= 0 && value < modulus;
 }
 
-bool IsZnStarElementMod(const mpz_class& value, const mpz_class& modulus) {
+bool IsZnStarResidue(const mpz_class& value, const mpz_class& modulus) {
   if (!IsInRange(value, modulus) || value == 0) {
     return false;
   }
@@ -375,7 +375,7 @@ std::optional<mpz_class> InvertMod(const mpz_class& value, const mpz_class& modu
   return inverse;
 }
 
-Bytes BuildWeakDigest(const char* proof_id,
+Bytes BuildWeakDigestFromFields(const char* proof_id,
                       const StrictProofVerifierContext& context,
                       const std::array<std::pair<const char*, Bytes>, 1>& fields) {
   Transcript transcript;
@@ -387,7 +387,7 @@ Bytes BuildWeakDigest(const char* proof_id,
   return Sha256(transcript.bytes());
 }
 
-Bytes BuildWeakDigest(const char* proof_id,
+Bytes BuildWeakDigestFromFields(const char* proof_id,
                       const StrictProofVerifierContext& context,
                       const std::array<std::pair<const char*, Bytes>, 3>& fields) {
   Transcript transcript;
@@ -506,7 +506,7 @@ mpz_class DeriveSquareFreeGmr98Challenge(const mpz_class& modulus_n,
                0,
                expanded.data());
     candidate %= modulus_n;
-    if (IsZnStarElementMod(candidate, modulus_n)) {
+    if (IsZnStarResidue(candidate, modulus_n)) {
       return candidate;
     }
   }
@@ -601,7 +601,7 @@ AuxParamStrictPayload DecodeAuxParamStrictPayload(std::span<const uint8_t> blob)
   return payload;
 }
 
-mpz_class PickCoprime(const mpz_class& modulus, const mpz_class& seed) {
+mpz_class PickCoprimeDeterministic(const mpz_class& modulus, const mpz_class& seed) {
   mpz_class value = seed % modulus;
   if (value < 2) {
     value = 2;
@@ -779,10 +779,10 @@ AuxRsaParams GenerateAuxRsaParams(uint32_t modulus_bits, PartyIndex party_id) {
       continue;
     }
 
-    const mpz_class h1 = PickCoprime(modulus_n, mpz_class(2 + 2 * party_id));
-    mpz_class h2 = PickCoprime(modulus_n, mpz_class(3 + 2 * party_id));
+    const mpz_class h1 = PickCoprimeDeterministic(modulus_n, mpz_class(2 + 2 * party_id));
+    mpz_class h2 = PickCoprimeDeterministic(modulus_n, mpz_class(3 + 2 * party_id));
     if (h1 == h2) {
-      h2 = PickCoprime(modulus_n, h1 + 1);
+      h2 = PickCoprimeDeterministic(modulus_n, h1 + 1);
     }
 
     AuxRsaParams params{
@@ -803,10 +803,10 @@ AuxRsaParams DeriveAuxRsaParamsFromModulus(const mpz_class& modulus_n, PartyInde
     throw std::invalid_argument("aux RSA modulus must be > 2");
   }
 
-  const mpz_class h1 = PickCoprime(modulus_n, mpz_class(2 + 2 * party_id));
-  mpz_class h2 = PickCoprime(modulus_n, mpz_class(3 + 2 * party_id));
+  const mpz_class h1 = PickCoprimeDeterministic(modulus_n, mpz_class(2 + 2 * party_id));
+  mpz_class h2 = PickCoprimeDeterministic(modulus_n, mpz_class(3 + 2 * party_id));
   if (h1 == h2) {
-    h2 = PickCoprime(modulus_n, h1 + 1);
+    h2 = PickCoprimeDeterministic(modulus_n, h1 + 1);
   }
 
   AuxRsaParams params{
@@ -824,7 +824,7 @@ SquareFreeProof BuildSquareFreeProofWeak(const mpz_class& modulus_n,
                                          const StrictProofVerifierContext& context) {
   SquareFreeProof proof;
   proof.metadata = MakeWeakMetadata(kSquareFreeSchemeIdWeak);
-  proof.blob = BuildWeakDigest(
+  proof.blob = BuildWeakDigestFromFields(
       kSquareFreeProofIdWeak,
       context,
       std::array<std::pair<const char*, Bytes>, 1>{{
@@ -941,11 +941,11 @@ bool VerifySquareFreeProofStrict(const mpz_class& modulus_n,
   if (payload.nonce.size() != kStrictNonceLen) {
     return false;
   }
-  if (!IsZnStarElementMod(payload.y, n2) ||
-      !IsZnStarElementMod(payload.t1, n2) ||
-      !IsZnStarElementMod(payload.t2, n2) ||
-      !IsZnStarElementMod(payload.z1, modulus_n) ||
-      !IsZnStarElementMod(payload.z2, modulus_n)) {
+  if (!IsZnStarResidue(payload.y, n2) ||
+      !IsZnStarResidue(payload.t1, n2) ||
+      !IsZnStarResidue(payload.t2, n2) ||
+      !IsZnStarResidue(payload.z1, modulus_n) ||
+      !IsZnStarResidue(payload.z2, modulus_n)) {
     return false;
   }
 
@@ -997,7 +997,7 @@ SquareFreeProof BuildSquareFreeProofGmr98(const mpz_class& modulus_n,
   for (uint32_t round = 0; round < payload.rounds; ++round) {
     const mpz_class challenge = DeriveSquareFreeGmr98Challenge(modulus_n, context, nonce, round);
     const mpz_class root = PowMod(challenge, d, modulus_n);
-    if (!IsZnStarElementMod(root, modulus_n)) {
+    if (!IsZnStarResidue(root, modulus_n)) {
       throw std::runtime_error("square-free GMR98 proof generated invalid root");
     }
     const mpz_class check = PowMod(root, modulus_n, modulus_n);
@@ -1072,7 +1072,7 @@ bool VerifySquareFreeProofGmr98(const mpz_class& modulus_n,
 
   for (uint32_t round = 0; round < payload.rounds; ++round) {
     const mpz_class& root = payload.roots[round];
-    if (!IsZnStarElementMod(root, modulus_n)) {
+    if (!IsZnStarResidue(root, modulus_n)) {
       return false;
     }
     const mpz_class challenge =
@@ -1107,7 +1107,7 @@ AuxRsaParamProof BuildAuxRsaParamProofWeak(const AuxRsaParams& params,
 
   AuxRsaParamProof proof;
   proof.metadata = MakeWeakMetadata(kAuxParamSchemeIdWeak);
-  proof.blob = BuildWeakDigest(
+  proof.blob = BuildWeakDigestFromFields(
       kAuxParamProofIdWeak,
       context,
       std::array<std::pair<const char*, Bytes>, 3>{{

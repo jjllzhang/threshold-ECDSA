@@ -137,7 +137,7 @@ BenchArgs ParseArgs(int argc, char** argv) {
     } else if (flag == "--paillier-bits" && i + 1 < argc) {
       args.paillier_bits = ParsePositiveU32(argv[++i], "--paillier-bits");
     } else if (flag == "--help") {
-      std::cout << "Usage: m9_bench [--n N] [--t T] [--keygen-iters K] [--sign-iters S] [--paillier-bits B]\n";
+      std::cout << "Usage: protocol_flow_bench [--n N] [--t T] [--keygen-iters K] [--sign-iters S] [--paillier-bits B]\n";
       std::exit(0);
     } else {
       throw std::invalid_argument("unknown argument: " + flag);
