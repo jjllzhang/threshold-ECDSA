@@ -60,6 +60,28 @@ void ExpectThrow(const std::function<void()>& fn, const std::string& message) {
   throw std::runtime_error("Expected exception: " + message);
 }
 
+uint32_t ReadU32BeAt(const Bytes& input, size_t offset) {
+  if (offset + 4 > input.size()) {
+    throw std::runtime_error("payload too short while reading u32");
+  }
+  return (static_cast<uint32_t>(input[offset]) << 24) |
+         (static_cast<uint32_t>(input[offset + 1]) << 16) |
+         (static_cast<uint32_t>(input[offset + 2]) << 8) |
+         static_cast<uint32_t>(input[offset + 3]);
+}
+
+Bytes TruncatePhase1PayloadToLegacy(const Bytes& payload) {
+  if (payload.size() < 32 + 4) {
+    throw std::runtime_error("phase1 payload too short to truncate");
+  }
+  const uint32_t n_len = ReadU32BeAt(payload, 32);
+  const size_t keep_len = 32 + 4 + n_len;
+  if (keep_len > payload.size()) {
+    throw std::runtime_error("phase1 payload malformed while truncating");
+  }
+  return Bytes(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(keep_len));
+}
+
 Envelope MakeEnvelope(Bytes session_id,
                       uint32_t type,
                       uint32_t from,
@@ -386,6 +408,39 @@ void TestSignSessionSkeletonAndTimeout() {
               "sign session must reject participant Paillier modulus not satisfying N > q^8");
 }
 
+void TestKeygenStrictRejectsLegacyPhase1PayloadShape() {
+  KeygenSessionConfig cfg1;
+  cfg1.session_id = {7, 7, 7};
+  cfg1.self_id = 1;
+  cfg1.participants = {1, 2, 3};
+  cfg1.threshold = 1;
+  cfg1.strict_mode = true;
+  cfg1.timeout = std::chrono::seconds(5);
+
+  KeygenSessionConfig cfg2 = cfg1;
+  cfg2.self_id = 2;
+  KeygenSessionConfig cfg3 = cfg1;
+  cfg3.self_id = 3;
+
+  KeygenSession session1(std::move(cfg1));
+  KeygenSession session2(std::move(cfg2));
+  KeygenSession session3(std::move(cfg3));
+
+  (void)session1.BuildPhase1CommitEnvelope();
+  Envelope from2 = session2.BuildPhase1CommitEnvelope();
+  Envelope from3 = session3.BuildPhase1CommitEnvelope();
+  from2.payload = TruncatePhase1PayloadToLegacy(from2.payload);
+
+  Expect(!session1.HandleEnvelope(from2),
+         "strict keygen must reject legacy phase1 payload shape");
+  Expect(session1.status() == SessionStatus::kAborted,
+         "strict keygen must abort on legacy phase1 payload shape");
+  Expect(!session1.HasResult(),
+         "aborted strict keygen session must not expose result");
+  Expect(!session1.HandleEnvelope(from3),
+         "aborted keygen session should not accept additional envelopes");
+}
+
 void TestSessionIdAndRecipientMismatchRejected() {
   KeygenSessionConfig cfg;
   cfg.session_id = {8, 8, 8};
@@ -415,6 +470,7 @@ int main() {
     TestSessionRouterFiltering();
     TestKeygenSessionSkeleton();
     TestSignSessionSkeletonAndTimeout();
+    TestKeygenStrictRejectsLegacyPhase1PayloadShape();
     TestSessionIdAndRecipientMismatchRejected();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';

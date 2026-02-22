@@ -403,12 +403,8 @@ ThreadPool& Phase2ThreadPool() {
 void AppendCommonMtaTranscriptFields(Transcript* transcript,
                                      const char* proof_id,
                                      const MtaProofContext& ctx) {
-  const std::span<const uint8_t> proof_id_view(
-      reinterpret_cast<const uint8_t*>(proof_id), std::strlen(proof_id));
-  transcript->append_fields({
-      TranscriptFieldRef{.label = "proof_id", .data = proof_id_view},
-      TranscriptFieldRef{.label = "session_id", .data = ctx.session_id},
-  });
+  transcript->append_proof_id(proof_id);
+  transcript->append_session_id(ctx.session_id);
   transcript->append_u32_be("initiator", ctx.initiator_id);
   transcript->append_u32_be("responder", ctx.responder_id);
   transcript->append_fields({
@@ -1135,14 +1131,10 @@ Scalar BuildSchnorrChallenge(const Bytes& session_id,
                              const ECPoint& statement,
                              const ECPoint& a) {
   Transcript transcript;
-  const std::span<const uint8_t> proof_id(
-      reinterpret_cast<const uint8_t*>(kSchnorrProofId), std::strlen(kSchnorrProofId));
   const Bytes statement_bytes = EncodePoint(statement);
   const Bytes a_bytes = EncodePoint(a);
-  transcript.append_fields({
-      TranscriptFieldRef{.label = "proof_id", .data = proof_id},
-      TranscriptFieldRef{.label = "session_id", .data = session_id},
-  });
+  transcript.append_proof_id(kSchnorrProofId);
+  transcript.append_session_id(session_id);
   transcript.append_u32_be("party_id", party_id);
   transcript.append_fields({
       TranscriptFieldRef{.label = "X", .data = statement_bytes},
@@ -1157,15 +1149,11 @@ Scalar BuildVRelationChallenge(const Bytes& session_id,
                                const ECPoint& v_statement,
                                const ECPoint& alpha) {
   Transcript transcript;
-  const std::span<const uint8_t> proof_id(
-      reinterpret_cast<const uint8_t*>(kVRelationProofId), std::strlen(kVRelationProofId));
   const Bytes r_bytes = EncodePoint(r_statement);
   const Bytes v_bytes = EncodePoint(v_statement);
   const Bytes alpha_bytes = EncodePoint(alpha);
-  transcript.append_fields({
-      TranscriptFieldRef{.label = "proof_id", .data = proof_id},
-      TranscriptFieldRef{.label = "session_id", .data = session_id},
-  });
+  transcript.append_proof_id(kVRelationProofId);
+  transcript.append_session_id(session_id);
   transcript.append_u32_be("party_id", party_id);
   transcript.append_fields({
       TranscriptFieldRef{.label = "R", .data = r_bytes},

@@ -121,6 +121,7 @@ class KeygenSession : public Session {
   std::unordered_set<PartyIndex> seen_phase2_opens_;
   std::unordered_set<PartyIndex> seen_phase2_shares_;
   std::unordered_set<PartyIndex> seen_phase3_;
+  std::unordered_set<PartyIndex> strict_phase1_non_legacy_parties_;
 
   bool local_phase2_ready_ = false;
   bool local_phase3_ready_ = false;

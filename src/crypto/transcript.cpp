@@ -23,6 +23,10 @@ std::array<uint8_t, SHA256_DIGEST_LENGTH> Sha256(std::span<const uint8_t> input)
   return digest;
 }
 
+std::span<const uint8_t> AsByteSpan(std::string_view value) {
+  return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size());
+}
+
 }  // namespace
 
 void Transcript::append(std::string_view label, std::span<const uint8_t> data) {
@@ -35,6 +39,18 @@ void Transcript::append(std::string_view label, std::span<const uint8_t> data) {
 
   AppendU32Be(static_cast<uint32_t>(data.size()), &transcript_);
   transcript_.insert(transcript_.end(), data.begin(), data.end());
+}
+
+void Transcript::append_ascii(std::string_view label, std::string_view ascii) {
+  append(label, AsByteSpan(ascii));
+}
+
+void Transcript::append_proof_id(std::string_view proof_id) {
+  append_ascii("proof_id", proof_id);
+}
+
+void Transcript::append_session_id(std::span<const uint8_t> session_id) {
+  append("session_id", session_id);
 }
 
 void Transcript::append_u32_be(std::string_view label, uint32_t value) {

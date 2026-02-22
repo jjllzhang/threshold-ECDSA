@@ -2,11 +2,13 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "tecdsa/crypto/encoding.hpp"
+#include "tecdsa/crypto/strict_proofs.hpp"
 #include "tecdsa/net/envelope.hpp"
 #include "tecdsa/protocol/keygen_session.hpp"
 
@@ -86,6 +88,56 @@ Bytes TruncatePhase3PayloadWithoutSquareFreeProof(const Bytes& payload) {
     throw std::runtime_error("phase3 payload too short to truncate");
   }
   return Bytes(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(kPhase3BaseLen));
+}
+
+void AppendU32Be(uint32_t value, Bytes* out) {
+  out->push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+  out->push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+  out->push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+  out->push_back(static_cast<uint8_t>(value & 0xFF));
+}
+
+size_t SkipSizedField(const Bytes& payload, size_t offset, const char* field_name) {
+  const uint32_t len = ReadU32Be(payload, offset);
+  offset += 4;
+  if (offset + len > payload.size()) {
+    throw std::runtime_error(std::string("phase1 payload malformed while parsing ") + field_name);
+  }
+  return offset + len;
+}
+
+Bytes RewritePhase1AuxProofAsLegacyBlob(const Bytes& payload) {
+  if (payload.size() < 32 + 4) {
+    throw std::runtime_error("phase1 payload too short to rewrite aux proof");
+  }
+
+  size_t offset = 32;
+  offset = SkipSizedField(payload, offset, "Paillier N");
+  offset = SkipSizedField(payload, offset, "aux Ntilde");
+  offset = SkipSizedField(payload, offset, "aux h1");
+  offset = SkipSizedField(payload, offset, "aux h2");
+  if (offset + 4 > payload.size()) {
+    throw std::runtime_error("phase1 payload missing aux proof length");
+  }
+  const size_t proof_len_offset = offset;
+  const uint32_t proof_len = ReadU32Be(payload, offset);
+  offset += 4;
+  if (offset + proof_len != payload.size()) {
+    throw std::runtime_error("phase1 payload has malformed aux proof field");
+  }
+
+  const std::span<const uint8_t> encoded_proof(payload.data() + offset, proof_len);
+  const tecdsa::AuxRsaParamProof decoded = tecdsa::DecodeAuxRsaParamProof(encoded_proof);
+  if (decoded.blob.empty()) {
+    throw std::runtime_error("decoded aux proof blob unexpectedly empty");
+  }
+
+  Bytes out;
+  out.reserve(payload.size());
+  out.insert(out.end(), payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(proof_len_offset));
+  AppendU32Be(static_cast<uint32_t>(decoded.blob.size()), &out);
+  out.insert(out.end(), decoded.blob.begin(), decoded.blob.end());
+  return out;
 }
 
 bool DeliverEnvelope(const Envelope& envelope,
@@ -411,6 +463,30 @@ void TestStrictModeMissingPhase1AuxProofAbortsReceiver() {
          "Strict receiver must abort when phase1 aux proof is missing");
 }
 
+void TestStrictModeLegacyAuxProofEncodingAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC6, 0x03, 0x01}, /*strict_mode=*/true);
+
+  std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase1) {
+    if (envelope.from == 1) {
+      envelope.payload = RewritePhase1AuxProofAsLegacyBlob(envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase1 payload to rewrite aux proof encoding");
+
+  for (const Envelope& envelope : phase1) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on legacy aux proof encoding");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on legacy aux proof encoding");
+}
+
 void TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver() {
   auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC4, 0x03, 0x01}, /*strict_mode=*/true);
 
@@ -479,6 +555,7 @@ int main() {
     TestTamperedPhase2ShareAbortsReceiver();
     TestTamperedPhase3SchnorrAbortsPeers();
     TestStrictModeMissingPhase1AuxProofAbortsReceiver();
+    TestStrictModeLegacyAuxProofEncodingAbortsReceiver();
     TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver();
     TestDevModeAcceptsLegacyPhase1WithoutProofs();
   } catch (const std::exception& ex) {

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -190,14 +189,10 @@ Scalar BuildSchnorrChallenge(const Bytes& session_id,
                              const ECPoint& statement,
                              const ECPoint& a) {
   Transcript transcript;
-  const std::span<const uint8_t> proof_id(
-      reinterpret_cast<const uint8_t*>(kSchnorrProofId), std::strlen(kSchnorrProofId));
   const Bytes statement_bytes = EncodePoint(statement);
   const Bytes a_bytes = EncodePoint(a);
-  transcript.append_fields({
-      TranscriptFieldRef{.label = "proof_id", .data = proof_id},
-      TranscriptFieldRef{.label = "session_id", .data = session_id},
-  });
+  transcript.append_proof_id(kSchnorrProofId);
+  transcript.append_session_id(session_id);
   transcript.append_u32_be("party_id", party_id);
   transcript.append_fields({
       TranscriptFieldRef{.label = "X", .data = statement_bytes},
@@ -366,6 +361,9 @@ Envelope KeygenSession::BuildPhase1CommitEnvelope() {
   result_.all_paillier_public[self_id()] = local_paillier_public_;
   result_.all_aux_rsa_params[self_id()] = local_aux_rsa_params_;
   result_.all_aux_param_proofs[self_id()] = local_aux_param_proof_;
+  if (strict_mode_) {
+    strict_phase1_non_legacy_parties_.insert(self_id());
+  }
 
   Bytes payload;
   payload.reserve(kCommitmentLen + 4 + 4 * 512 + 4 + 64);
@@ -504,8 +502,14 @@ bool KeygenSession::HasResult() const {
       result_.all_aux_param_proofs.size() != participants_.size()) {
     return false;
   }
+  if (strict_phase1_non_legacy_parties_.size() != participants_.size()) {
+    return false;
+  }
 
   for (PartyIndex party : participants_) {
+    if (!strict_phase1_non_legacy_parties_.contains(party)) {
+      return false;
+    }
     const auto pk_it = result_.all_paillier_public.find(party);
     const auto aux_it = result_.all_aux_rsa_params.find(party);
     const auto square_it = result_.all_square_free_proofs.find(party);
@@ -650,6 +654,9 @@ bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
     AuxRsaParamProof aux_param_proof;
     bool has_aux_param_proof = false;
     if (offset == envelope.payload.size()) {
+      if (strict_mode_) {
+        throw std::invalid_argument("legacy phase1 payload shape is not allowed in strict mode");
+      }
       aux_params = DeriveAuxRsaParamsFromModulus(paillier_n, envelope.from);
     } else {
       aux_params.n_tilde = ReadMpzField(
@@ -686,6 +693,7 @@ bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
       if (!VerifyAuxRsaParamProofWeak(aux_params, aux_param_proof)) {
         throw std::invalid_argument("aux parameter proof verification failed in strict mode");
       }
+      strict_phase1_non_legacy_parties_.insert(envelope.from);
     } else if (has_aux_param_proof && !VerifyAuxRsaParamProofWeak(aux_params, aux_param_proof)) {
       throw std::invalid_argument("aux parameter proof verification failed");
     }
@@ -929,10 +937,16 @@ void KeygenSession::MaybeAdvanceAfterPhase1() {
     return;
   }
   if (strict_mode_) {
+    if (strict_phase1_non_legacy_parties_.size() != participants_.size()) {
+      return;
+    }
     if (result_.all_aux_param_proofs.size() != participants_.size()) {
       return;
     }
     for (PartyIndex party : participants_) {
+      if (!strict_phase1_non_legacy_parties_.contains(party)) {
+        return;
+      }
       const auto aux_it = result_.all_aux_rsa_params.find(party);
       const auto aux_pf_it = result_.all_aux_param_proofs.find(party);
       if (aux_it == result_.all_aux_rsa_params.end() ||
