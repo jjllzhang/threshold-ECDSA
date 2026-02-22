@@ -104,6 +104,17 @@ class SignSession : public Session {
   static uint32_t Phase2ResponseMessageType();
 
  private:
+  struct SchnorrProof {
+    ECPoint a;
+    Scalar z;
+  };
+
+  struct VRelationProof {
+    ECPoint alpha;
+    Scalar t;
+    Scalar u;
+  };
+
   enum class MtaType : uint8_t {
     kTimesGamma = 1,
     kTimesW = 2,
@@ -119,12 +130,15 @@ class SignSession : public Session {
 
   struct Phase4OpenData {
     ECPoint gamma_i;
+    SchnorrProof gamma_proof;
     Bytes randomness;
   };
 
   struct Phase5BOpenData {
     ECPoint V_i;
     ECPoint A_i;
+    SchnorrProof a_schnorr_proof;
+    VRelationProof v_relation_proof;
     Bytes randomness;
   };
 
@@ -164,6 +178,18 @@ class SignSession : public Session {
   void MaybeAdvanceAfterPhase5C();
   void MaybeAdvanceAfterPhase5D();
   void MaybeAdvanceAfterPhase5E();
+  SchnorrProof BuildSchnorrProof(const ECPoint& statement, const Scalar& witness) const;
+  bool VerifySchnorrProof(PartyIndex prover_id,
+                          const ECPoint& statement,
+                          const SchnorrProof& proof) const;
+  VRelationProof BuildVRelationProof(const ECPoint& r_statement,
+                                     const ECPoint& v_statement,
+                                     const Scalar& s_witness,
+                                     const Scalar& l_witness) const;
+  bool VerifyVRelationProof(PartyIndex prover_id,
+                            const ECPoint& r_statement,
+                            const ECPoint& v_statement,
+                            const VRelationProof& proof) const;
 
   std::vector<PartyIndex> participants_;
   std::unordered_set<PartyIndex> peers_;

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -18,6 +19,7 @@ extern "C" {
 #include "tecdsa/crypto/commitment.hpp"
 #include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/crypto/random.hpp"
+#include "tecdsa/crypto/transcript.hpp"
 
 namespace tecdsa {
 namespace {
@@ -31,6 +33,8 @@ constexpr size_t kMaxMpzEncodedLen = 8192;
 constexpr char kPhase1CommitDomain[] = "GG2019/sign/phase1";
 constexpr char kPhase5ACommitDomain[] = "GG2019/sign/phase5A";
 constexpr char kPhase5CCommitDomain[] = "GG2019/sign/phase5C";
+constexpr char kSchnorrProofId[] = "GG2019/Schnorr/v1";
+constexpr char kVRelationProofId[] = "GG2019/VRel/v1";
 
 void ValidateParticipantsOrThrow(const std::vector<PartyIndex>& participants, PartyIndex self_id) {
   if (participants.size() < 2) {
@@ -85,6 +89,13 @@ uint32_t ReadU32Be(std::span<const uint8_t> input, size_t* offset) {
          (static_cast<uint32_t>(input[i + 1]) << 16) |
          (static_cast<uint32_t>(input[i + 2]) << 8) |
          static_cast<uint32_t>(input[i + 3]);
+}
+
+Bytes PartyIdToBytes(PartyIndex id) {
+  Bytes out;
+  out.reserve(4);
+  AppendU32Be(id, &out);
+  return out;
 }
 
 void AppendSizedField(std::span<const uint8_t> field, Bytes* out) {
@@ -374,6 +385,69 @@ Scalar XCoordinateModQ(const ECPoint& point) {
   return Scalar::FromBigEndianModQ(x_bytes);
 }
 
+Scalar BuildSchnorrChallenge(const Bytes& session_id,
+                             PartyIndex party_id,
+                             const ECPoint& statement,
+                             const ECPoint& a) {
+  Transcript transcript;
+  const std::span<const uint8_t> proof_id(
+      reinterpret_cast<const uint8_t*>(kSchnorrProofId), std::strlen(kSchnorrProofId));
+  transcript.append("proof_id", proof_id);
+  transcript.append("session_id", session_id);
+  const Bytes party_bytes = PartyIdToBytes(party_id);
+  transcript.append("party_id", party_bytes);
+  const Bytes statement_bytes = EncodePoint(statement);
+  transcript.append("X", statement_bytes);
+  const Bytes a_bytes = EncodePoint(a);
+  transcript.append("A", a_bytes);
+  return transcript.challenge_scalar_mod_q();
+}
+
+Scalar BuildVRelationChallenge(const Bytes& session_id,
+                               PartyIndex party_id,
+                               const ECPoint& r_statement,
+                               const ECPoint& v_statement,
+                               const ECPoint& alpha) {
+  Transcript transcript;
+  const std::span<const uint8_t> proof_id(
+      reinterpret_cast<const uint8_t*>(kVRelationProofId), std::strlen(kVRelationProofId));
+  transcript.append("proof_id", proof_id);
+  transcript.append("session_id", session_id);
+  const Bytes party_bytes = PartyIdToBytes(party_id);
+  transcript.append("party_id", party_bytes);
+  const Bytes r_bytes = EncodePoint(r_statement);
+  transcript.append("R", r_bytes);
+  const Bytes v_bytes = EncodePoint(v_statement);
+  transcript.append("V", v_bytes);
+  const Bytes alpha_bytes = EncodePoint(alpha);
+  transcript.append("alpha", alpha_bytes);
+  return transcript.challenge_scalar_mod_q();
+}
+
+ECPoint BuildRGeneratorLinearCombination(const ECPoint& r_base,
+                                         const Scalar& r_multiplier,
+                                         const Scalar& g_multiplier) {
+  std::optional<ECPoint> out;
+
+  if (r_multiplier.value() != 0) {
+    out = r_base.Mul(r_multiplier);
+  }
+
+  if (g_multiplier.value() != 0) {
+    const ECPoint g_term = ECPoint::GeneratorMultiply(g_multiplier);
+    if (out.has_value()) {
+      out = out->Add(g_term);
+    } else {
+      out = g_term;
+    }
+  }
+
+  if (!out.has_value()) {
+    throw std::invalid_argument("linear combination is point at infinity");
+  }
+  return *out;
+}
+
 }  // namespace
 
 SignSession::SignSession(SignSessionConfig cfg)
@@ -536,14 +610,21 @@ Envelope SignSession::BuildPhase4OpenGammaEnvelope() {
   }
 
   PreparePhase1SecretsIfNeeded();
+  const SchnorrProof gamma_proof = BuildSchnorrProof(local_Gamma_i_, local_gamma_i_);
 
   local_phase4_ready_ = true;
-  phase4_open_data_[self_id()] = Phase4OpenData{.gamma_i = local_Gamma_i_, .randomness = local_phase1_randomness_};
+  phase4_open_data_[self_id()] = Phase4OpenData{
+      .gamma_i = local_Gamma_i_,
+      .gamma_proof = gamma_proof,
+      .randomness = local_phase1_randomness_,
+  };
 
   Bytes payload;
-  payload.reserve(kPointCompressedLen + 4 + local_phase1_randomness_.size());
+  payload.reserve(kPointCompressedLen + 4 + local_phase1_randomness_.size() + kPointCompressedLen + kScalarLen);
   AppendPoint(local_Gamma_i_, &payload);
   AppendSizedField(local_phase1_randomness_, &payload);
+  AppendPoint(gamma_proof.a, &payload);
+  AppendScalar(gamma_proof.z, &payload);
 
   Envelope out;
   out.session_id = session_id();
@@ -603,15 +684,29 @@ Envelope SignSession::BuildPhase5BOpenEnvelope() {
     throw std::logic_error("BuildPhase5BOpenEnvelope must be called in sign phase5B");
   }
 
+  const SchnorrProof a_schnorr_proof = BuildSchnorrProof(local_A_i_, local_rho_i_);
+  const VRelationProof v_relation_proof =
+      BuildVRelationProof(R_, local_V_i_, local_s_i_, local_l_i_);
+
   local_phase5b_ready_ = true;
-  phase5b_open_data_[self_id()] =
-      Phase5BOpenData{.V_i = local_V_i_, .A_i = local_A_i_, .randomness = local_phase5a_randomness_};
+  phase5b_open_data_[self_id()] = Phase5BOpenData{
+      .V_i = local_V_i_,
+      .A_i = local_A_i_,
+      .a_schnorr_proof = a_schnorr_proof,
+      .v_relation_proof = v_relation_proof,
+      .randomness = local_phase5a_randomness_,
+  };
 
   Bytes payload;
-  payload.reserve(kPointCompressedLen * 2 + 4 + local_phase5a_randomness_.size());
+  payload.reserve(kPointCompressedLen * 4 + kScalarLen * 3 + 4 + local_phase5a_randomness_.size());
   AppendPoint(local_V_i_, &payload);
   AppendPoint(local_A_i_, &payload);
   AppendSizedField(local_phase5a_randomness_, &payload);
+  AppendPoint(a_schnorr_proof.a, &payload);
+  AppendScalar(a_schnorr_proof.z, &payload);
+  AppendPoint(v_relation_proof.alpha, &payload);
+  AppendScalar(v_relation_proof.t, &payload);
+  AppendScalar(v_relation_proof.u, &payload);
 
   Envelope out;
   out.session_id = session_id();
@@ -1089,6 +1184,8 @@ bool SignSession::HandlePhase4OpenEnvelope(const Envelope& envelope) {
     const ECPoint gamma_i = ReadPoint(envelope.payload, &offset);
     const Bytes randomness =
         ReadSizedField(envelope.payload, &offset, kMaxOpenRandomnessLen, "sign phase4 open randomness");
+    const ECPoint proof_a = ReadPoint(envelope.payload, &offset);
+    const Scalar proof_z = ReadScalar(envelope.payload, &offset);
     if (offset != envelope.payload.size()) {
       throw std::invalid_argument("sign phase4 payload has trailing bytes");
     }
@@ -1103,7 +1200,16 @@ bool SignSession::HandlePhase4OpenEnvelope(const Envelope& envelope) {
       throw std::invalid_argument("phase4 open does not match phase1 commitment");
     }
 
-    phase4_open_data_[envelope.from] = Phase4OpenData{.gamma_i = gamma_i, .randomness = randomness};
+    const SchnorrProof gamma_proof{.a = proof_a, .z = proof_z};
+    if (!VerifySchnorrProof(envelope.from, gamma_i, gamma_proof)) {
+      throw std::invalid_argument("phase4 gamma Schnorr proof verification failed");
+    }
+
+    phase4_open_data_[envelope.from] = Phase4OpenData{
+        .gamma_i = gamma_i,
+        .gamma_proof = gamma_proof,
+        .randomness = randomness,
+    };
   } catch (const std::exception& ex) {
     Abort(std::string("invalid sign phase4 payload: ") + ex.what());
     return false;
@@ -1152,6 +1258,11 @@ bool SignSession::HandlePhase5BOpenEnvelope(const Envelope& envelope) {
     const ECPoint A_i = ReadPoint(envelope.payload, &offset);
     const Bytes randomness =
         ReadSizedField(envelope.payload, &offset, kMaxOpenRandomnessLen, "sign phase5B open randomness");
+    const ECPoint schnorr_a = ReadPoint(envelope.payload, &offset);
+    const Scalar schnorr_z = ReadScalar(envelope.payload, &offset);
+    const ECPoint relation_alpha = ReadPoint(envelope.payload, &offset);
+    const Scalar relation_t = ReadScalar(envelope.payload, &offset);
+    const Scalar relation_u = ReadScalar(envelope.payload, &offset);
     if (offset != envelope.payload.size()) {
       throw std::invalid_argument("sign phase5B payload has trailing bytes");
     }
@@ -1166,7 +1277,23 @@ bool SignSession::HandlePhase5BOpenEnvelope(const Envelope& envelope) {
       throw std::invalid_argument("phase5B open does not match phase5A commitment");
     }
 
-    phase5b_open_data_[envelope.from] = Phase5BOpenData{.V_i = V_i, .A_i = A_i, .randomness = randomness};
+    const SchnorrProof a_schnorr_proof{.a = schnorr_a, .z = schnorr_z};
+    if (!VerifySchnorrProof(envelope.from, A_i, a_schnorr_proof)) {
+      throw std::invalid_argument("phase5B A_i Schnorr proof verification failed");
+    }
+
+    const VRelationProof v_relation_proof{.alpha = relation_alpha, .t = relation_t, .u = relation_u};
+    if (!VerifyVRelationProof(envelope.from, R_, V_i, v_relation_proof)) {
+      throw std::invalid_argument("phase5B V relation proof verification failed");
+    }
+
+    phase5b_open_data_[envelope.from] = Phase5BOpenData{
+        .V_i = V_i,
+        .A_i = A_i,
+        .a_schnorr_proof = a_schnorr_proof,
+        .v_relation_proof = v_relation_proof,
+        .randomness = randomness,
+    };
   } catch (const std::exception& ex) {
     Abort(std::string("invalid sign phase5B payload: ") + ex.what());
     return false;
@@ -1711,6 +1838,101 @@ void SignSession::MaybeAdvanceAfterPhase5E() {
     return;
   }
   FinalizeSignatureAndComplete();
+}
+
+SignSession::SchnorrProof SignSession::BuildSchnorrProof(const ECPoint& statement,
+                                                         const Scalar& witness) const {
+  if (witness.value() == 0) {
+    throw std::invalid_argument("schnorr witness must be non-zero");
+  }
+
+  while (true) {
+    const Scalar r = RandomNonZeroScalar();
+    const ECPoint a = ECPoint::GeneratorMultiply(r);
+    const Scalar e = BuildSchnorrChallenge(session_id(), self_id(), statement, a);
+    const Scalar z = r + (e * witness);
+    if (z.value() == 0) {
+      continue;
+    }
+    return SchnorrProof{.a = a, .z = z};
+  }
+}
+
+bool SignSession::VerifySchnorrProof(PartyIndex prover_id,
+                                     const ECPoint& statement,
+                                     const SchnorrProof& proof) const {
+  if (proof.z.value() == 0) {
+    return false;
+  }
+
+  try {
+    const Scalar e = BuildSchnorrChallenge(session_id(), prover_id, statement, proof.a);
+    const ECPoint lhs = ECPoint::GeneratorMultiply(proof.z);
+
+    ECPoint rhs = proof.a;
+    if (e.value() != 0) {
+      rhs = rhs.Add(statement.Mul(e));
+    }
+    return lhs == rhs;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+SignSession::VRelationProof SignSession::BuildVRelationProof(const ECPoint& r_statement,
+                                                             const ECPoint& v_statement,
+                                                             const Scalar& s_witness,
+                                                             const Scalar& l_witness) const {
+  while (true) {
+    const Scalar a = Csprng::RandomScalar();
+    const Scalar b = Csprng::RandomScalar();
+    if (a.value() == 0 && b.value() == 0) {
+      continue;
+    }
+
+    ECPoint alpha;
+    try {
+      alpha = BuildRGeneratorLinearCombination(r_statement, a, b);
+    } catch (const std::exception&) {
+      continue;
+    }
+
+    const Scalar c = BuildVRelationChallenge(session_id(), self_id(), r_statement, v_statement, alpha);
+    const Scalar t = a + (c * s_witness);
+    const Scalar u = b + (c * l_witness);
+    if (t.value() == 0 && u.value() == 0) {
+      continue;
+    }
+
+    return VRelationProof{
+        .alpha = alpha,
+        .t = t,
+        .u = u,
+    };
+  }
+}
+
+bool SignSession::VerifyVRelationProof(PartyIndex prover_id,
+                                       const ECPoint& r_statement,
+                                       const ECPoint& v_statement,
+                                       const VRelationProof& proof) const {
+  if (proof.t.value() == 0 && proof.u.value() == 0) {
+    return false;
+  }
+
+  try {
+    const Scalar c = BuildVRelationChallenge(
+        session_id(), prover_id, r_statement, v_statement, proof.alpha);
+    const ECPoint lhs = BuildRGeneratorLinearCombination(r_statement, proof.t, proof.u);
+
+    ECPoint rhs = proof.alpha;
+    if (c.value() != 0) {
+      rhs = rhs.Add(v_statement.Mul(c));
+    }
+    return lhs == rhs;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 }  // namespace tecdsa

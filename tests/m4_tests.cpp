@@ -385,7 +385,7 @@ void EnsureAllSessionsInPhase(const std::vector<std::unique_ptr<SignSession>>& s
   }
 }
 
-void RunToPhase5D(std::vector<std::unique_ptr<SignSession>>* sessions,
+void RunToPhase5B(std::vector<std::unique_ptr<SignSession>>* sessions,
                   const std::vector<PartyIndex>& signers) {
   DeliverSignEnvelopesOrThrow(CollectPhase1Messages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase2);
@@ -418,12 +418,52 @@ void RunToPhase5D(std::vector<std::unique_ptr<SignSession>>* sessions,
 
   DeliverSignEnvelopesOrThrow(CollectPhase5AMessages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5B);
+}
+
+void RunToPhase5D(std::vector<std::unique_ptr<SignSession>>* sessions,
+                  const std::vector<PartyIndex>& signers) {
+  RunToPhase5B(sessions, signers);
 
   DeliverSignEnvelopesOrThrow(CollectPhase5BMessages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5C);
 
   DeliverSignEnvelopesOrThrow(CollectPhase5CMessages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5D);
+}
+
+uint32_t ReadU32Be(const Bytes& input, size_t offset) {
+  if (offset + 4 > input.size()) {
+    throw std::runtime_error("payload is too short to parse u32");
+  }
+  return (static_cast<uint32_t>(input[offset]) << 24) |
+         (static_cast<uint32_t>(input[offset + 1]) << 16) |
+         (static_cast<uint32_t>(input[offset + 2]) << 8) |
+         static_cast<uint32_t>(input[offset + 3]);
+}
+
+bool TamperPhase5BSchnorrProof(Envelope* envelope) {
+  if (envelope == nullptr) {
+    return false;
+  }
+  size_t offset = 0;
+  constexpr size_t kPointLen = 33;
+  constexpr size_t kScalarLen = 32;
+
+  if (envelope->payload.size() < kPointLen * 2 + 4 + kPointLen + kScalarLen) {
+    return false;
+  }
+  offset += kPointLen;  // V_i
+  offset += kPointLen;  // A_i
+  const uint32_t randomness_len = ReadU32Be(envelope->payload, offset);
+  offset += 4;
+  if (offset + randomness_len + kPointLen + kScalarLen > envelope->payload.size()) {
+    return false;
+  }
+  offset += randomness_len;
+  offset += kPointLen;  // Schnorr A
+
+  envelope->payload[offset + kScalarLen - 1] ^= 0x01;  // Schnorr z
+  return true;
 }
 
 void TestM4SignEndToEndProducesVerifiableSignature() {
@@ -543,6 +583,134 @@ void TestM5Phase2InstanceIdMismatchAborts() {
   Expect(any_aborted, "At least one signer must abort on mismatched phase2 instance id");
 }
 
+void TestM6TamperedPhase4GammaSchnorrAbortsReceiver() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD4, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE4, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  for (size_t round = 0; round < 32; ++round) {
+    const std::vector<Envelope> phase2_messages = CollectPhase2Messages(&sessions);
+    if (phase2_messages.empty()) {
+      throw std::runtime_error("phase2 stalled before MtA/MtAwc completion");
+    }
+    DeliverSignEnvelopesOrThrow(phase2_messages, signers, &sessions);
+
+    bool all_phase3 = true;
+    for (const auto& session : sessions) {
+      if (session->phase() != SignPhase::kPhase3) {
+        all_phase3 = false;
+        break;
+      }
+    }
+    if (all_phase3) {
+      break;
+    }
+  }
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase3);
+
+  DeliverSignEnvelopesOrThrow(CollectPhase3Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase4);
+
+  std::vector<Envelope> phase4_messages = CollectPhase4Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase4_messages) {
+    if (envelope.from == 1 && !envelope.payload.empty()) {
+      envelope.payload.back() ^= 0x01;
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase4 proof payload to tamper");
+
+  for (const Envelope& envelope : phase4_messages) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Receiver must abort when phase4 gamma Schnorr proof is tampered");
+  Expect(sessions[receiver_idx]->phase() == SignPhase::kPhase4,
+         "Phase4 proof failure should abort in phase4");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Phase4 proof failure must not expose signature result");
+  }
+}
+
+void TestM6TamperedPhase5BASchnorrAbortsReceiver() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD5, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE5, 0x02, 0x01});
+
+  RunToPhase5B(&sessions, signers);
+
+  std::vector<Envelope> phase5b_messages = CollectPhase5BMessages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase5b_messages) {
+    if (envelope.from == 1) {
+      tampered = TamperPhase5BSchnorrProof(&envelope);
+      if (tampered) {
+        break;
+      }
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase5B Schnorr proof payload to tamper");
+
+  for (const Envelope& envelope : phase5b_messages) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Receiver must abort when phase5B A_i Schnorr proof is tampered");
+  Expect(sessions[receiver_idx]->phase() == SignPhase::kPhase5,
+         "Phase5B proof failure should abort in phase5");
+  Expect(sessions[receiver_idx]->phase5_stage() == SignPhase5Stage::kPhase5B,
+         "Phase5B A_i proof failure should abort in stage5B");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Phase5B Schnorr proof failure must not expose signature result");
+  }
+}
+
+void TestM6TamperedPhase5BVRelationAbortsReceiver() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD6, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE6, 0x02, 0x01});
+
+  RunToPhase5B(&sessions, signers);
+
+  std::vector<Envelope> phase5b_messages = CollectPhase5BMessages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase5b_messages) {
+    if (envelope.from == 1 && !envelope.payload.empty()) {
+      envelope.payload.back() ^= 0x01;
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase5B relation proof payload to tamper");
+
+  for (const Envelope& envelope : phase5b_messages) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Receiver must abort when phase5B V relation proof is tampered");
+  Expect(sessions[receiver_idx]->phase() == SignPhase::kPhase5,
+         "Phase5B proof failure should abort in phase5");
+  Expect(sessions[receiver_idx]->phase5_stage() == SignPhase5Stage::kPhase5B,
+         "Phase5B relation proof failure should abort in stage5B");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Phase5B relation proof failure must not expose signature result");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -550,11 +718,14 @@ int main() {
     TestM4SignEndToEndProducesVerifiableSignature();
     TestM4Phase5DFailurePreventsPhase5EReveal();
     TestM5Phase2InstanceIdMismatchAborts();
+    TestM6TamperedPhase4GammaSchnorrAbortsReceiver();
+    TestM6TamperedPhase5BASchnorrAbortsReceiver();
+    TestM6TamperedPhase5BVRelationAbortsReceiver();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';
     return 1;
   }
 
-  std::cout << "M4/M5 tests passed" << '\n';
+  std::cout << "M4/M5/M6 tests passed" << '\n';
   return 0;
 }
