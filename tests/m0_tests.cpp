@@ -7,9 +7,12 @@
 #include <gmpxx.h>
 
 #include "tecdsa/common/bytes.hpp"
+#include "tecdsa/crypto/commitment.hpp"
 #include "tecdsa/crypto/ec_point.hpp"
 #include "tecdsa/crypto/encoding.hpp"
+#include "tecdsa/crypto/hash.hpp"
 #include "tecdsa/crypto/paillier.hpp"
+#include "tecdsa/crypto/random.hpp"
 #include "tecdsa/crypto/scalar.hpp"
 #include "tecdsa/crypto/transcript.hpp"
 #include "tecdsa/net/envelope.hpp"
@@ -20,11 +23,15 @@ using tecdsa::Bytes;
 using tecdsa::DecodeEnvelope;
 using tecdsa::DecodeMpz;
 using tecdsa::ECPoint;
+using tecdsa::CommitMessage;
+using tecdsa::ComputeCommitment;
 using tecdsa::EncodeEnvelope;
 using tecdsa::EncodeMpz;
 using tecdsa::Envelope;
 using tecdsa::PaillierProvider;
 using tecdsa::Scalar;
+using tecdsa::Sha256;
+using tecdsa::VerifyCommitment;
 using tecdsa::Transcript;
 
 void Expect(bool condition, const std::string& message) {
@@ -94,14 +101,10 @@ void TestScalarEncodingAndReduction() {
 }
 
 void TestPointEncoding() {
-  Bytes compressed(33, 0);
-  compressed[0] = 0x02;
-  for (size_t i = 1; i < compressed.size(); ++i) {
-    compressed[i] = static_cast<uint8_t>(i);
-  }
-
-  const ECPoint point = ECPoint::FromCompressed(compressed);
-  Expect(point.ToCompressedBytes() == compressed, "ECPoint round-trip must preserve bytes");
+  const ECPoint g = ECPoint::GeneratorMultiply(Scalar::FromUint64(1));
+  const Bytes compressed = g.ToCompressedBytes();
+  const ECPoint parsed = ECPoint::FromCompressed(compressed);
+  Expect(parsed == g, "ECPoint round-trip must preserve valid points");
 
   Bytes invalid_prefix = compressed;
   invalid_prefix[0] = 0x04;
@@ -111,6 +114,70 @@ void TestPointEncoding() {
   Bytes invalid_len(32, 0x02);
   ExpectThrow([&]() { (void)ECPoint::FromCompressed(invalid_len); },
               "ECPoint rejects invalid length");
+
+  Bytes invalid_curve(33, 0x00);
+  invalid_curve[0] = 0x02;
+  ExpectThrow([&]() { (void)ECPoint::FromCompressed(invalid_curve); },
+              "ECPoint rejects bytes not on secp256k1 curve");
+}
+
+void TestPointArithmetic() {
+  const Scalar one = Scalar::FromUint64(1);
+  const Scalar two = Scalar::FromUint64(2);
+  const Scalar three = Scalar::FromUint64(3);
+  const Scalar six = Scalar::FromUint64(6);
+
+  const ECPoint g = ECPoint::GeneratorMultiply(one);
+  const ECPoint g2 = ECPoint::GeneratorMultiply(two);
+  const ECPoint g3 = ECPoint::GeneratorMultiply(three);
+
+  const ECPoint g_plus_g2 = g.Add(g2);
+  Expect(g_plus_g2 == g3, "ECPoint::Add should match scalar multiplication");
+
+  const ECPoint g3_mul_two = g3.Mul(two);
+  const ECPoint g6 = ECPoint::GeneratorMultiply(six);
+  Expect(g3_mul_two == g6, "ECPoint::Mul should match generator multiplication");
+
+  ExpectThrow([&]() { (void)ECPoint::GeneratorMultiply(Scalar::FromUint64(0)); },
+              "GeneratorMultiply rejects zero scalar");
+}
+
+void TestHashAndCommitment() {
+  const Bytes msg = {'a', 'b', 'c'};
+  const Bytes digest = Sha256(msg);
+  const Bytes expected = {
+      0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+      0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+      0xf2, 0x00, 0x15, 0xad};
+  Expect(digest == expected, "SHA256 must match known test vector for 'abc'");
+
+  const std::string domain = "keygen/phase1";
+  const Bytes randomness = {1, 2, 3, 4, 5};
+  const Bytes commitment = ComputeCommitment(domain, msg, randomness);
+  Expect(VerifyCommitment(domain, msg, randomness, commitment), "Commitment verifies for valid open");
+
+  Bytes tampered_msg = msg;
+  tampered_msg[0] ^= 0x01;
+  Expect(!VerifyCommitment(domain, tampered_msg, randomness, commitment),
+         "Commitment verify fails for tampered message");
+
+  Bytes tampered_r = randomness;
+  tampered_r.back() ^= 0x01;
+  Expect(!VerifyCommitment(domain, msg, tampered_r, commitment),
+         "Commitment verify fails for tampered randomness");
+
+  const auto generated = CommitMessage(domain, msg);
+  Expect(generated.randomness.size() == 32, "CommitMessage default randomness length is 32");
+  Expect(VerifyCommitment(domain, msg, generated.randomness, generated.commitment),
+         "CommitMessage output should verify");
+}
+
+void TestCsprng() {
+  const Bytes random16 = tecdsa::Csprng::RandomBytes(16);
+  Expect(random16.size() == 16, "Csprng::RandomBytes should return requested length");
+
+  const Scalar s = tecdsa::Csprng::RandomScalar();
+  Expect(s.value() < Scalar::ModulusQ(), "Csprng::RandomScalar should return value in Z_q");
 }
 
 void TestEnvelopeRoundTrip() {
@@ -196,6 +263,9 @@ int main() {
     TestMpzRoundTrip();
     TestScalarEncodingAndReduction();
     TestPointEncoding();
+    TestPointArithmetic();
+    TestHashAndCommitment();
+    TestCsprng();
     TestEnvelopeRoundTrip();
     TestTranscriptChallengeDeterminismAndOrder();
     TestPaillierViaLibhcs();

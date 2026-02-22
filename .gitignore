@@ -46,5 +46,5 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
-gg2019_implementation_plan.md
-gg2019_threshold_ecdsa_full_impl_spec.md
+# gg2019_implementation_plan.md
+# gg2019_threshold_ecdsa_full_impl_spec.md

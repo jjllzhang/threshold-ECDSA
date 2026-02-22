@@ -1,3 +1,6 @@
 [submodule "third_party/libhcs"]
 	path = third_party/libhcs
 	url = https://github.com/tiehuis/libhcs.git
+[submodule "third_party/secp256k1"]
+	path = third_party/secp256k1
+	url = https://github.com/bitcoin-core/secp256k1.git

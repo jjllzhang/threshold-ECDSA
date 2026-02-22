@@ -5,15 +5,20 @@
 #include <span>
 
 #include "tecdsa/common/bytes.hpp"
+#include "tecdsa/crypto/scalar.hpp"
 
 namespace tecdsa {
 
 class ECPoint {
  public:
   ECPoint();
-  explicit ECPoint(std::span<const uint8_t> compressed_bytes);
 
   static ECPoint FromCompressed(std::span<const uint8_t> compressed_bytes);
+  static ECPoint GeneratorMultiply(const Scalar& scalar);
+
+  ECPoint Add(const ECPoint& other) const;
+  ECPoint Mul(const Scalar& scalar) const;
+
   Bytes ToCompressedBytes() const;
 
   bool operator==(const ECPoint& other) const;
