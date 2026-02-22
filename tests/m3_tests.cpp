@@ -80,6 +80,14 @@ Bytes TruncatePhase1PayloadToLegacy(const Bytes& payload) {
   return Bytes(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(keep_len));
 }
 
+Bytes TruncatePhase3PayloadWithoutSquareFreeProof(const Bytes& payload) {
+  constexpr size_t kPhase3BaseLen = 33 + 33 + 32;
+  if (payload.size() < kPhase3BaseLen) {
+    throw std::runtime_error("phase3 payload too short to truncate");
+  }
+  return Bytes(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(kPhase3BaseLen));
+}
+
 bool DeliverEnvelope(const Envelope& envelope,
                      std::vector<std::unique_ptr<KeygenSession>>* sessions) {
   bool ok = true;
@@ -379,7 +387,7 @@ void TestTamperedPhase3SchnorrAbortsPeers() {
          "Peer 3 must abort when Schnorr proof is tampered");
 }
 
-void TestStrictModeMissingPhase1ProofAbortsReceiver() {
+void TestStrictModeMissingPhase1AuxProofAbortsReceiver() {
   auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC2, 0x03, 0x01}, /*strict_mode=*/true);
 
   std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
@@ -398,9 +406,39 @@ void TestStrictModeMissingPhase1ProofAbortsReceiver() {
   }
 
   Expect(sessions[1]->status() == SessionStatus::kAborted,
-         "Strict receiver must abort when phase1 strict proofs are missing");
+         "Strict receiver must abort when phase1 aux proof is missing");
   Expect(sessions[2]->status() == SessionStatus::kAborted,
-         "Strict receiver must abort when phase1 strict proofs are missing");
+         "Strict receiver must abort when phase1 aux proof is missing");
+}
+
+void TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC4, 0x03, 0x01}, /*strict_mode=*/true);
+
+  const std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  DeliverEnvelopesOrThrow(phase1, &sessions);
+  const std::vector<Envelope> phase2 = BuildAndCollectPhase2(&sessions);
+  DeliverEnvelopesOrThrow(phase2, &sessions);
+  EnsureAllSessionsInPhase(sessions, KeygenPhase::kPhase3);
+
+  std::vector<Envelope> phase3 = BuildAndCollectPhase3(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase3) {
+    if (envelope.from == 1) {
+      envelope.payload = TruncatePhase3PayloadWithoutSquareFreeProof(envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase3 payload to drop square-free proof");
+
+  for (const Envelope& envelope : phase3) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort when phase3 square-free proof is missing");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort when phase3 square-free proof is missing");
 }
 
 void TestDevModeAcceptsLegacyPhase1WithoutProofs() {
@@ -440,7 +478,8 @@ int main() {
     TestTamperedPhase1PaillierModulusAbortsReceiver();
     TestTamperedPhase2ShareAbortsReceiver();
     TestTamperedPhase3SchnorrAbortsPeers();
-    TestStrictModeMissingPhase1ProofAbortsReceiver();
+    TestStrictModeMissingPhase1AuxProofAbortsReceiver();
+    TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver();
     TestDevModeAcceptsLegacyPhase1WithoutProofs();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';

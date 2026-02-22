@@ -37,6 +37,7 @@ struct KeygenSessionConfig {
   std::vector<PartyIndex> participants;
   uint32_t threshold = 1;
   uint32_t paillier_modulus_bits = 2048;
+  uint32_t aux_rsa_modulus_bits = 2048;
   bool strict_mode = true;
   std::chrono::milliseconds timeout = std::chrono::seconds(30);
 };
@@ -112,6 +113,7 @@ class KeygenSession : public Session {
   std::vector<PartyIndex> participants_;
   uint32_t threshold_ = 1;
   uint32_t paillier_modulus_bits_ = 2048;
+  uint32_t aux_rsa_modulus_bits_ = 2048;
   bool strict_mode_ = true;
   std::unordered_set<PartyIndex> peers_;
 

@@ -23,7 +23,9 @@ constexpr size_t kScalarLen = 32;
 constexpr size_t kMaxOpenRandomnessLen = 1024;
 constexpr size_t kMaxPaillierModulusFieldLen = 8192;
 constexpr size_t kMaxProofBlobLen = 4096;
+constexpr size_t kMaxProofFieldLen = 8192;
 constexpr uint32_t kMinPaillierKeygenBits = 2048;
+constexpr uint32_t kMinAuxRsaKeygenBits = 2048;
 constexpr size_t kMaxPaillierKeygenAttempts = 32;
 constexpr char kPhase1CommitDomain[] = "GG2019/keygen/phase1";
 constexpr char kSchnorrProofId[] = "GG2019/Schnorr/v1";
@@ -232,6 +234,7 @@ KeygenSession::KeygenSession(KeygenSessionConfig cfg)
       participants_(std::move(cfg.participants)),
       threshold_(cfg.threshold),
       paillier_modulus_bits_(cfg.paillier_modulus_bits),
+      aux_rsa_modulus_bits_(cfg.aux_rsa_modulus_bits),
       strict_mode_(cfg.strict_mode),
       peers_(BuildPeerSet(participants_, cfg.self_id)) {
   ValidateParticipantsOrThrow(participants_, cfg.self_id);
@@ -240,6 +243,9 @@ KeygenSession::KeygenSession(KeygenSessionConfig cfg)
   }
   if (paillier_modulus_bits_ < kMinPaillierKeygenBits) {
     throw std::invalid_argument("paillier_modulus_bits must be >= 2048");
+  }
+  if (aux_rsa_modulus_bits_ < kMinAuxRsaKeygenBits) {
+    throw std::invalid_argument("aux_rsa_modulus_bits must be >= 2048");
   }
   result_.strict_mode = strict_mode_;
 }
@@ -364,18 +370,17 @@ Envelope KeygenSession::BuildPhase1CommitEnvelope() {
   phase1_commitments_[self_id()] = local_commitment_;
   result_.all_paillier_public[self_id()] = local_paillier_public_;
   result_.all_aux_rsa_params[self_id()] = local_aux_rsa_params_;
-  result_.all_square_free_proofs[self_id()] = local_square_free_proof_;
   result_.all_aux_param_proofs[self_id()] = local_aux_param_proof_;
 
   Bytes payload;
-  payload.reserve(kCommitmentLen + 4 + 5 * 512 + 8 + 2 * 64);
+  payload.reserve(kCommitmentLen + 4 + 4 * 512 + 4 + 64);
   payload.insert(payload.end(), local_commitment_.begin(), local_commitment_.end());
   AppendMpzField(local_paillier_public_.n, &payload);
   AppendMpzField(local_aux_rsa_params_.n_tilde, &payload);
   AppendMpzField(local_aux_rsa_params_.h1, &payload);
   AppendMpzField(local_aux_rsa_params_.h2, &payload);
-  AppendSizedField(local_square_free_proof_.blob, &payload);
-  AppendSizedField(local_aux_param_proof_.blob, &payload);
+  const Bytes aux_param_proof_wire = EncodeAuxRsaParamProof(local_aux_param_proof_);
+  AppendSizedField(aux_param_proof_wire, &payload);
 
   Envelope out;
   out.session_id = session_id();
@@ -466,10 +471,14 @@ Envelope KeygenSession::BuildPhase3XiProofEnvelope() {
   }
 
   Bytes serialized;
-  serialized.reserve(kPointCompressedLen + kPointCompressedLen + kScalarLen);
+  const Bytes square_free_proof_wire = EncodeSquareFreeProof(local_square_free_proof_);
+  serialized.reserve(kPointCompressedLen + kPointCompressedLen + kScalarLen +
+                     4 + square_free_proof_wire.size());
   AppendPoint(local_phase3_payload_->X_i, &serialized);
   AppendPoint(local_phase3_payload_->proof.a, &serialized);
   AppendScalar(local_phase3_payload_->proof.z, &serialized);
+  AppendSizedField(square_free_proof_wire, &serialized);
+  result_.all_square_free_proofs[self_id()] = local_square_free_proof_;
 
   Envelope out;
   out.session_id = session_id();
@@ -511,8 +520,12 @@ bool KeygenSession::HasResult() const {
         aux_pf_it == result_.all_aux_param_proofs.end()) {
       return false;
     }
-    if (!VerifySquareFreeProof(pk_it->second.n, square_it->second) ||
-        !VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second)) {
+    if (square_it->second.metadata.scheme == StrictProofScheme::kUnknown ||
+        aux_pf_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+      return false;
+    }
+    if (!VerifySquareFreeProofWeak(pk_it->second.n, square_it->second) ||
+        !VerifyAuxRsaParamProofWeak(aux_it->second, aux_pf_it->second)) {
       return false;
     }
   }
@@ -603,15 +616,15 @@ void KeygenSession::EnsureLocalStrictProofArtifactsPrepared() {
     throw std::logic_error("local Paillier key must be prepared before strict artifacts");
   }
 
-  local_aux_rsa_params_ = DeriveAuxRsaParamsFromModulus(local_paillier_public_.n, self_id());
+  local_aux_rsa_params_ = GenerateAuxRsaParams(aux_rsa_modulus_bits_, self_id());
   local_square_free_proof_ = BuildSquareFreeProof(local_paillier_public_.n);
   local_aux_param_proof_ = BuildAuxRsaParamProof(local_aux_rsa_params_);
 
   if (strict_mode_) {
-    if (!VerifySquareFreeProof(local_paillier_public_.n, local_square_free_proof_)) {
+    if (!VerifySquareFreeProofWeak(local_paillier_public_.n, local_square_free_proof_)) {
       throw std::runtime_error("failed to self-verify local square-free proof");
     }
-    if (!VerifyAuxRsaParamProof(local_aux_rsa_params_, local_aux_param_proof_)) {
+    if (!VerifyAuxRsaParamProofWeak(local_aux_rsa_params_, local_aux_param_proof_)) {
       throw std::runtime_error("failed to self-verify local aux param proof");
     }
   }
@@ -639,8 +652,8 @@ bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
     ValidatePaillierPublicKeyOrThrow(pub);
 
     AuxRsaParams aux_params;
-    SquareFreeProof square_free_proof;
     AuxRsaParamProof aux_param_proof;
+    bool has_aux_param_proof = false;
     if (offset == envelope.payload.size()) {
       aux_params = DeriveAuxRsaParamsFromModulus(paillier_n, envelope.from);
     } else {
@@ -653,10 +666,12 @@ bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
       if (!ValidateAuxRsaParams(aux_params)) {
         throw std::invalid_argument("invalid aux RSA parameters");
       }
-      square_free_proof.blob = ReadSizedField(
-          envelope.payload, &offset, kMaxProofBlobLen, "keygen phase1 square-free proof");
-      aux_param_proof.blob = ReadSizedField(
-          envelope.payload, &offset, kMaxProofBlobLen, "keygen phase1 aux parameter proof");
+      const Bytes aux_param_proof_wire = ReadSizedField(
+          envelope.payload, &offset, kMaxProofFieldLen, "keygen phase1 aux parameter proof");
+      if (!aux_param_proof_wire.empty()) {
+        aux_param_proof = DecodeAuxRsaParamProof(aux_param_proof_wire, kMaxProofBlobLen);
+        has_aux_param_proof = true;
+      }
       if (offset != envelope.payload.size()) {
         throw std::invalid_argument("keygen phase1 payload has trailing bytes");
       }
@@ -667,26 +682,25 @@ bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
     }
 
     if (strict_mode_) {
-      if (!VerifySquareFreeProof(paillier_n, square_free_proof)) {
-        throw std::invalid_argument("square-free proof verification failed in strict mode");
+      if (!has_aux_param_proof) {
+        throw std::invalid_argument("missing aux parameter proof in strict mode");
       }
-      if (!VerifyAuxRsaParamProof(aux_params, aux_param_proof)) {
+      if (aux_param_proof.metadata.scheme == StrictProofScheme::kUnknown) {
+        throw std::invalid_argument("legacy aux parameter proof format is not allowed in strict mode");
+      }
+      if (!VerifyAuxRsaParamProofWeak(aux_params, aux_param_proof)) {
         throw std::invalid_argument("aux parameter proof verification failed in strict mode");
       }
-    } else {
-      if (!square_free_proof.blob.empty() && !VerifySquareFreeProof(paillier_n, square_free_proof)) {
-        throw std::invalid_argument("square-free proof verification failed");
-      }
-      if (!aux_param_proof.blob.empty() && !VerifyAuxRsaParamProof(aux_params, aux_param_proof)) {
-        throw std::invalid_argument("aux parameter proof verification failed");
-      }
+    } else if (has_aux_param_proof && !VerifyAuxRsaParamProofWeak(aux_params, aux_param_proof)) {
+      throw std::invalid_argument("aux parameter proof verification failed");
     }
 
     phase1_commitments_[envelope.from] = std::move(commitment);
     result_.all_paillier_public[envelope.from] = pub;
     result_.all_aux_rsa_params[envelope.from] = std::move(aux_params);
-    result_.all_square_free_proofs[envelope.from] = std::move(square_free_proof);
-    result_.all_aux_param_proofs[envelope.from] = std::move(aux_param_proof);
+    if (has_aux_param_proof) {
+      result_.all_aux_param_proofs[envelope.from] = std::move(aux_param_proof);
+    }
   } catch (const std::exception& ex) {
     Abort(std::string("invalid keygen phase1 payload: ") + ex.what());
     return false;
@@ -818,17 +832,50 @@ bool KeygenSession::HandlePhase3XiProofEnvelope(const Envelope& envelope) {
     const ECPoint X_i = ReadPoint(envelope.payload, &offset);
     const ECPoint a = ReadPoint(envelope.payload, &offset);
     const Scalar z = ReadScalar(envelope.payload, &offset);
-    if (offset != envelope.payload.size()) {
-      throw std::invalid_argument("keygen phase3 payload has trailing bytes");
-    }
 
     const SchnorrProof proof{.a = a, .z = z};
     if (!VerifySchnorrProof(envelope.from, X_i, proof)) {
       throw std::invalid_argument("schnorr proof verification failed");
     }
 
+    const auto pk_it = result_.all_paillier_public.find(envelope.from);
+    if (pk_it == result_.all_paillier_public.end()) {
+      throw std::invalid_argument("missing Paillier public key for phase3 sender");
+    }
+
+    SquareFreeProof square_free_proof;
+    bool has_square_free_proof = false;
+    if (offset < envelope.payload.size()) {
+      const Bytes square_free_proof_wire = ReadSizedField(
+          envelope.payload, &offset, kMaxProofFieldLen, "keygen phase3 square-free proof");
+      if (!square_free_proof_wire.empty()) {
+        square_free_proof = DecodeSquareFreeProof(square_free_proof_wire, kMaxProofBlobLen);
+        has_square_free_proof = true;
+      }
+    }
+    if (offset != envelope.payload.size()) {
+      throw std::invalid_argument("keygen phase3 payload has trailing bytes");
+    }
+
+    if (strict_mode_) {
+      if (!has_square_free_proof) {
+        throw std::invalid_argument("missing square-free proof in strict mode");
+      }
+      if (square_free_proof.metadata.scheme == StrictProofScheme::kUnknown) {
+        throw std::invalid_argument("legacy square-free proof format is not allowed in strict mode");
+      }
+      if (!VerifySquareFreeProofWeak(pk_it->second.n, square_free_proof)) {
+        throw std::invalid_argument("square-free proof verification failed in strict mode");
+      }
+    } else if (has_square_free_proof && !VerifySquareFreeProofWeak(pk_it->second.n, square_free_proof)) {
+      throw std::invalid_argument("square-free proof verification failed");
+    }
+
     phase3_broadcasts_[envelope.from] = Phase3BroadcastData{.X_i = X_i, .proof = proof};
     result_.all_X_i[envelope.from] = X_i;
+    if (has_square_free_proof) {
+      result_.all_square_free_proofs[envelope.from] = std::move(square_free_proof);
+    }
   } catch (const std::exception& ex) {
     Abort(std::string("invalid keygen phase3 payload: ") + ex.what());
     return false;
@@ -887,24 +934,20 @@ void KeygenSession::MaybeAdvanceAfterPhase1() {
     return;
   }
   if (strict_mode_) {
-    if (result_.all_square_free_proofs.size() != participants_.size()) {
-      return;
-    }
     if (result_.all_aux_param_proofs.size() != participants_.size()) {
       return;
     }
     for (PartyIndex party : participants_) {
-      const auto pk_it = result_.all_paillier_public.find(party);
       const auto aux_it = result_.all_aux_rsa_params.find(party);
-      const auto square_it = result_.all_square_free_proofs.find(party);
       const auto aux_pf_it = result_.all_aux_param_proofs.find(party);
-      if (pk_it == result_.all_paillier_public.end() || aux_it == result_.all_aux_rsa_params.end() ||
-          square_it == result_.all_square_free_proofs.end() ||
+      if (aux_it == result_.all_aux_rsa_params.end() ||
           aux_pf_it == result_.all_aux_param_proofs.end()) {
         return;
       }
-      if (!VerifySquareFreeProof(pk_it->second.n, square_it->second) ||
-          !VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second)) {
+      if (aux_pf_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+        return;
+      }
+      if (!VerifyAuxRsaParamProofWeak(aux_it->second, aux_pf_it->second)) {
         return;
       }
     }
@@ -957,6 +1000,25 @@ void KeygenSession::MaybeAdvanceAfterPhase3() {
   }
   if (result_.all_X_i.size() != participants_.size()) {
     return;
+  }
+  if (strict_mode_) {
+    if (result_.all_square_free_proofs.size() != participants_.size()) {
+      return;
+    }
+    for (PartyIndex party : participants_) {
+      const auto pk_it = result_.all_paillier_public.find(party);
+      const auto square_it = result_.all_square_free_proofs.find(party);
+      if (pk_it == result_.all_paillier_public.end() ||
+          square_it == result_.all_square_free_proofs.end()) {
+        return;
+      }
+      if (square_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+        return;
+      }
+      if (!VerifySquareFreeProofWeak(pk_it->second.n, square_it->second)) {
+        return;
+      }
+    }
   }
 
   phase_ = KeygenPhase::kCompleted;
