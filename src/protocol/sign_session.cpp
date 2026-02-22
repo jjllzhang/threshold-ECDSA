@@ -1209,7 +1209,11 @@ SignSession::SignSession(SignSessionConfig cfg)
     if (strict_mode_ && !has_square_proof) {
       throw std::invalid_argument("strict mode requires square-free proof for each participant");
     }
-    if (has_square_proof && !VerifySquareFreeProof(paillier_it->second.n, square_it->second)) {
+    if (strict_mode_ && has_square_proof &&
+        square_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+      throw std::invalid_argument("strict mode does not allow legacy square-free proof format");
+    }
+    if (has_square_proof && !VerifySquareFreeProofWeak(paillier_it->second.n, square_it->second)) {
       throw std::invalid_argument("square-free proof verification failed");
     }
 
@@ -1219,7 +1223,11 @@ SignSession::SignSession(SignSessionConfig cfg)
     if (strict_mode_ && !has_aux_proof) {
       throw std::invalid_argument("strict mode requires aux parameter proof for each participant");
     }
-    if (has_aux_proof && !VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second)) {
+    if (strict_mode_ && has_aux_proof &&
+        aux_pf_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+      throw std::invalid_argument("strict mode does not allow legacy aux proof format");
+    }
+    if (has_aux_proof && !VerifyAuxRsaParamProofWeak(aux_it->second, aux_pf_it->second)) {
       throw std::invalid_argument("aux parameter proof verification failed");
     }
   }
