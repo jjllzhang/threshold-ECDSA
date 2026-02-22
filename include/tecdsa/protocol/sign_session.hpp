@@ -54,6 +54,7 @@ struct SignSessionConfig {
   using AuxRsaParamProof = tecdsa::AuxRsaParamProof;
 
   Bytes session_id;
+  Bytes keygen_session_id;
   PartyIndex self_id = 0;
   std::vector<PartyIndex> participants;
   std::chrono::milliseconds timeout = std::chrono::seconds(30);
@@ -65,6 +66,8 @@ struct SignSessionConfig {
   std::unordered_map<PartyIndex, AuxRsaParams> all_aux_rsa_params;
   std::unordered_map<PartyIndex, SquareFreeProof> all_square_free_proofs;
   std::unordered_map<PartyIndex, AuxRsaParamProof> all_aux_param_proofs;
+  ProofMetadata square_free_proof_profile;
+  ProofMetadata aux_param_proof_profile;
   std::shared_ptr<PaillierProvider> local_paillier;
   Bytes msg32;
   bool strict_mode = true;
@@ -213,6 +216,8 @@ class SignSession : public Session {
   std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> all_aux_rsa_params_;
   std::unordered_map<PartyIndex, SignSessionConfig::SquareFreeProof> all_square_free_proofs_;
   std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParamProof> all_aux_param_proofs_;
+  ProofMetadata expected_square_free_proof_profile_;
+  ProofMetadata expected_aux_param_proof_profile_;
   std::shared_ptr<PaillierProvider> local_paillier_;
   bool strict_mode_ = true;
 

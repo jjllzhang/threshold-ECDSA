@@ -218,6 +218,18 @@ void ValidatePaillierPublicKeyOrThrow(const PaillierPublicKey& pub) {
   }
 }
 
+StrictProofVerifierContext BuildStrictProofContext(const Bytes& session_id,
+                                                   PartyIndex prover_id) {
+  StrictProofVerifierContext context;
+  context.session_id = session_id;
+  context.prover_id = prover_id;
+  return context;
+}
+
+bool StrictMetadataCompatible(const ProofMetadata& expected, const ProofMetadata& candidate) {
+  return IsProofMetadataCompatible(expected, candidate, /*require_strict_scheme=*/true);
+}
+
 }  // namespace
 
 KeygenSession::KeygenSession(KeygenSessionConfig cfg)
@@ -227,6 +239,8 @@ KeygenSession::KeygenSession(KeygenSessionConfig cfg)
       paillier_modulus_bits_(cfg.paillier_modulus_bits),
       aux_rsa_modulus_bits_(cfg.aux_rsa_modulus_bits),
       strict_mode_(cfg.strict_mode),
+      expected_square_free_proof_profile_(std::move(cfg.expected_square_free_proof_profile)),
+      expected_aux_param_proof_profile_(std::move(cfg.expected_aux_param_proof_profile)),
       peers_(BuildPeerSet(participants_, cfg.self_id)) {
   ValidateParticipantsOrThrow(participants_, cfg.self_id);
   if (threshold_ >= participants_.size()) {
@@ -238,6 +252,19 @@ KeygenSession::KeygenSession(KeygenSessionConfig cfg)
   if (aux_rsa_modulus_bits_ < kMinAuxRsaKeygenBits) {
     throw std::invalid_argument("aux_rsa_modulus_bits must be >= 2048");
   }
+  if (strict_mode_) {
+    if (expected_square_free_proof_profile_.scheme != StrictProofScheme::kUnknown &&
+        !IsStrictProofScheme(expected_square_free_proof_profile_.scheme)) {
+      throw std::invalid_argument("strict keygen expected square-free profile must use strict scheme");
+    }
+    if (expected_aux_param_proof_profile_.scheme != StrictProofScheme::kUnknown &&
+        !IsStrictProofScheme(expected_aux_param_proof_profile_.scheme)) {
+      throw std::invalid_argument("strict keygen expected aux profile must use strict scheme");
+    }
+  }
+  result_.keygen_session_id = session_id();
+  result_.square_free_proof_profile = expected_square_free_proof_profile_;
+  result_.aux_param_proof_profile = expected_aux_param_proof_profile_;
   result_.strict_mode = strict_mode_;
 }
 
@@ -553,6 +580,10 @@ bool KeygenSession::HasResult() const {
       result_.all_aux_param_proofs.size() != participants_.size()) {
     return false;
   }
+  if (result_.square_free_proof_profile.scheme == StrictProofScheme::kUnknown ||
+      result_.aux_param_proof_profile.scheme == StrictProofScheme::kUnknown) {
+    return false;
+  }
   if (strict_phase1_non_legacy_parties_.size() != participants_.size()) {
     return false;
   }
@@ -570,12 +601,13 @@ bool KeygenSession::HasResult() const {
         aux_pf_it == result_.all_aux_param_proofs.end()) {
       return false;
     }
-    if (square_it->second.metadata.scheme == StrictProofScheme::kUnknown ||
-        aux_pf_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+    if (!StrictMetadataCompatible(result_.square_free_proof_profile, square_it->second.metadata) ||
+        !StrictMetadataCompatible(result_.aux_param_proof_profile, aux_pf_it->second.metadata)) {
       return false;
     }
-    if (!VerifySquareFreeProofWeak(pk_it->second.n, square_it->second) ||
-        !VerifyAuxRsaParamProofWeak(aux_it->second, aux_pf_it->second)) {
+    const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), party);
+    if (!VerifySquareFreeProofStrict(pk_it->second.n, square_it->second, context) ||
+        !VerifyAuxRsaParamProofStrict(aux_it->second, aux_pf_it->second, context)) {
       return false;
     }
   }
@@ -666,15 +698,31 @@ void KeygenSession::EnsureLocalStrictProofArtifactsPrepared() {
     throw std::logic_error("local Paillier key must be prepared before strict artifacts");
   }
 
+  const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), self_id());
   local_aux_rsa_params_ = GenerateAuxRsaParams(aux_rsa_modulus_bits_, self_id());
-  local_square_free_proof_ = BuildSquareFreeProof(local_paillier_public_.n);
-  local_aux_param_proof_ = BuildAuxRsaParamProof(local_aux_rsa_params_);
+  local_square_free_proof_ = BuildSquareFreeProof(local_paillier_public_.n, context);
+  local_aux_param_proof_ = BuildAuxRsaParamProof(local_aux_rsa_params_, context);
+
+  if (expected_square_free_proof_profile_.scheme == StrictProofScheme::kUnknown) {
+    expected_square_free_proof_profile_ = local_square_free_proof_.metadata;
+  }
+  if (expected_aux_param_proof_profile_.scheme == StrictProofScheme::kUnknown) {
+    expected_aux_param_proof_profile_ = local_aux_param_proof_.metadata;
+  }
+  result_.square_free_proof_profile = expected_square_free_proof_profile_;
+  result_.aux_param_proof_profile = expected_aux_param_proof_profile_;
 
   if (strict_mode_) {
-    if (!VerifySquareFreeProofWeak(local_paillier_public_.n, local_square_free_proof_)) {
+    if (!StrictMetadataCompatible(expected_square_free_proof_profile_, local_square_free_proof_.metadata)) {
+      throw std::runtime_error("local square-free proof metadata does not match expected strict profile");
+    }
+    if (!StrictMetadataCompatible(expected_aux_param_proof_profile_, local_aux_param_proof_.metadata)) {
+      throw std::runtime_error("local aux proof metadata does not match expected strict profile");
+    }
+    if (!VerifySquareFreeProofStrict(local_paillier_public_.n, local_square_free_proof_, context)) {
       throw std::runtime_error("failed to self-verify local square-free proof");
     }
-    if (!VerifyAuxRsaParamProofWeak(local_aux_rsa_params_, local_aux_param_proof_)) {
+    if (!VerifyAuxRsaParamProofStrict(local_aux_rsa_params_, local_aux_param_proof_, context)) {
       throw std::runtime_error("failed to self-verify local aux param proof");
     }
   }
@@ -735,17 +783,26 @@ bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
     }
 
     if (strict_mode_) {
+      const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), envelope.from);
       if (!has_aux_param_proof) {
         throw std::invalid_argument("missing aux parameter proof in strict mode");
       }
-      if (aux_param_proof.metadata.scheme == StrictProofScheme::kUnknown) {
-        throw std::invalid_argument("legacy aux parameter proof format is not allowed in strict mode");
+      if (expected_aux_param_proof_profile_.scheme == StrictProofScheme::kUnknown) {
+        expected_aux_param_proof_profile_ = aux_param_proof.metadata;
+        result_.aux_param_proof_profile = expected_aux_param_proof_profile_;
       }
-      if (!VerifyAuxRsaParamProofWeak(aux_params, aux_param_proof)) {
+      if (!StrictMetadataCompatible(expected_aux_param_proof_profile_, aux_param_proof.metadata)) {
+        throw std::invalid_argument("aux parameter proof metadata is not compatible with strict profile");
+      }
+      if (!VerifyAuxRsaParamProofStrict(aux_params, aux_param_proof, context)) {
         throw std::invalid_argument("aux parameter proof verification failed in strict mode");
       }
       strict_phase1_non_legacy_parties_.insert(envelope.from);
-    } else if (has_aux_param_proof && !VerifyAuxRsaParamProofWeak(aux_params, aux_param_proof)) {
+    } else if (has_aux_param_proof &&
+               !VerifyAuxRsaParamProof(
+                   aux_params,
+                   aux_param_proof,
+                   BuildStrictProofContext(session_id(), envelope.from))) {
       throw std::invalid_argument("aux parameter proof verification failed");
     }
 
@@ -912,16 +969,25 @@ bool KeygenSession::HandlePhase3XiProofEnvelope(const Envelope& envelope) {
     }
 
     if (strict_mode_) {
+      const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), envelope.from);
       if (!has_square_free_proof) {
         throw std::invalid_argument("missing square-free proof in strict mode");
       }
-      if (square_free_proof.metadata.scheme == StrictProofScheme::kUnknown) {
-        throw std::invalid_argument("legacy square-free proof format is not allowed in strict mode");
+      if (expected_square_free_proof_profile_.scheme == StrictProofScheme::kUnknown) {
+        expected_square_free_proof_profile_ = square_free_proof.metadata;
+        result_.square_free_proof_profile = expected_square_free_proof_profile_;
       }
-      if (!VerifySquareFreeProofWeak(pk_it->second.n, square_free_proof)) {
+      if (!StrictMetadataCompatible(expected_square_free_proof_profile_, square_free_proof.metadata)) {
+        throw std::invalid_argument("square-free proof metadata is not compatible with strict profile");
+      }
+      if (!VerifySquareFreeProofStrict(pk_it->second.n, square_free_proof, context)) {
         throw std::invalid_argument("square-free proof verification failed in strict mode");
       }
-    } else if (has_square_free_proof && !VerifySquareFreeProofWeak(pk_it->second.n, square_free_proof)) {
+    } else if (has_square_free_proof &&
+               !VerifySquareFreeProof(
+                   pk_it->second.n,
+                   square_free_proof,
+                   BuildStrictProofContext(session_id(), envelope.from))) {
       throw std::invalid_argument("square-free proof verification failed");
     }
 
@@ -991,6 +1057,9 @@ void KeygenSession::MaybeAdvanceAfterPhase1() {
     if (strict_phase1_non_legacy_parties_.size() != participants_.size()) {
       return;
     }
+    if (result_.aux_param_proof_profile.scheme == StrictProofScheme::kUnknown) {
+      return;
+    }
     if (result_.all_aux_param_proofs.size() != participants_.size()) {
       return;
     }
@@ -1004,10 +1073,11 @@ void KeygenSession::MaybeAdvanceAfterPhase1() {
           aux_pf_it == result_.all_aux_param_proofs.end()) {
         return;
       }
-      if (aux_pf_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+      if (!StrictMetadataCompatible(result_.aux_param_proof_profile, aux_pf_it->second.metadata)) {
         return;
       }
-      if (!VerifyAuxRsaParamProofWeak(aux_it->second, aux_pf_it->second)) {
+      const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), party);
+      if (!VerifyAuxRsaParamProofStrict(aux_it->second, aux_pf_it->second, context)) {
         return;
       }
     }
@@ -1062,6 +1132,9 @@ void KeygenSession::MaybeAdvanceAfterPhase3() {
     return;
   }
   if (strict_mode_) {
+    if (result_.square_free_proof_profile.scheme == StrictProofScheme::kUnknown) {
+      return;
+    }
     if (result_.all_square_free_proofs.size() != participants_.size()) {
       return;
     }
@@ -1072,10 +1145,11 @@ void KeygenSession::MaybeAdvanceAfterPhase3() {
           square_it == result_.all_square_free_proofs.end()) {
         return;
       }
-      if (square_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
+      if (!StrictMetadataCompatible(result_.square_free_proof_profile, square_it->second.metadata)) {
         return;
       }
-      if (!VerifySquareFreeProofWeak(pk_it->second.n, square_it->second)) {
+      const StrictProofVerifierContext context = BuildStrictProofContext(session_id(), party);
+      if (!VerifySquareFreeProofStrict(pk_it->second.n, square_it->second, context)) {
         return;
       }
     }

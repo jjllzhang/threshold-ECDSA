@@ -316,6 +316,20 @@ const mpz_class& MinPaillierModulusQ8() {
   return q_pow_8;
 }
 
+StrictProofVerifierContext BuildKeygenProofContext(const Bytes& keygen_session_id,
+                                                   PartyIndex prover_id) {
+  StrictProofVerifierContext context;
+  if (!keygen_session_id.empty()) {
+    context.session_id = keygen_session_id;
+    context.prover_id = prover_id;
+  }
+  return context;
+}
+
+bool StrictMetadataCompatible(const ProofMetadata& expected, const ProofMetadata& candidate) {
+  return IsProofMetadataCompatible(expected, candidate, /*require_strict_scheme=*/true);
+}
+
 mpz_class NormalizeMod(const mpz_class& value, const mpz_class& modulus) {
   mpz_class out = value % modulus;
   if (out < 0) {
@@ -1199,6 +1213,8 @@ SignSession::SignSession(SignSessionConfig cfg)
       all_aux_rsa_params_(std::move(cfg.all_aux_rsa_params)),
       all_square_free_proofs_(std::move(cfg.all_square_free_proofs)),
       all_aux_param_proofs_(std::move(cfg.all_aux_param_proofs)),
+      expected_square_free_proof_profile_(std::move(cfg.square_free_proof_profile)),
+      expected_aux_param_proof_profile_(std::move(cfg.aux_param_proof_profile)),
       local_paillier_(std::move(cfg.local_paillier)),
       strict_mode_(cfg.strict_mode),
       local_x_i_(cfg.x_i),
@@ -1207,6 +1223,7 @@ SignSession::SignSession(SignSessionConfig cfg)
       fixed_k_i_(cfg.fixed_k_i),
       fixed_gamma_i_(cfg.fixed_gamma_i) {
   ValidateParticipantsOrThrow(participants_, cfg.self_id);
+  const Bytes keygen_session_id = std::move(cfg.keygen_session_id);
 
   if (msg32_.size() != 32) {
     throw std::invalid_argument("msg32 must be exactly 32 bytes for SignSession");
@@ -1216,6 +1233,16 @@ SignSession::SignSession(SignSessionConfig cfg)
   }
   if (local_paillier_ == nullptr) {
     throw std::invalid_argument("local Paillier provider must be present");
+  }
+  if (strict_mode_) {
+    if (expected_square_free_proof_profile_.scheme != StrictProofScheme::kUnknown &&
+        !IsStrictProofScheme(expected_square_free_proof_profile_.scheme)) {
+      throw std::invalid_argument("strict sign expected square-free profile must use strict scheme");
+    }
+    if (expected_aux_param_proof_profile_.scheme != StrictProofScheme::kUnknown &&
+        !IsStrictProofScheme(expected_aux_param_proof_profile_.scheme)) {
+      throw std::invalid_argument("strict sign expected aux profile must use strict scheme");
+    }
   }
 
   for (PartyIndex party : participants_) {
@@ -1242,12 +1269,21 @@ SignSession::SignSession(SignSessionConfig cfg)
     if (strict_mode_ && !has_square_proof) {
       throw std::invalid_argument("strict mode requires square-free proof for each participant");
     }
-    if (strict_mode_ && has_square_proof &&
-        square_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
-      throw std::invalid_argument("strict mode does not allow legacy square-free proof format");
-    }
-    if (has_square_proof && !VerifySquareFreeProofWeak(paillier_it->second.n, square_it->second)) {
-      throw std::invalid_argument("square-free proof verification failed");
+    if (has_square_proof) {
+      const StrictProofVerifierContext context = BuildKeygenProofContext(keygen_session_id, party);
+      if (strict_mode_) {
+        if (expected_square_free_proof_profile_.scheme == StrictProofScheme::kUnknown) {
+          expected_square_free_proof_profile_ = square_it->second.metadata;
+        }
+        if (!StrictMetadataCompatible(expected_square_free_proof_profile_, square_it->second.metadata)) {
+          throw std::invalid_argument("square-free proof metadata is not compatible with strict profile");
+        }
+        if (!VerifySquareFreeProofStrict(paillier_it->second.n, square_it->second, context)) {
+          throw std::invalid_argument("square-free proof verification failed");
+        }
+      } else if (!VerifySquareFreeProof(paillier_it->second.n, square_it->second, context)) {
+        throw std::invalid_argument("square-free proof verification failed");
+      }
     }
 
     const auto aux_pf_it = all_aux_param_proofs_.find(party);
@@ -1256,12 +1292,21 @@ SignSession::SignSession(SignSessionConfig cfg)
     if (strict_mode_ && !has_aux_proof) {
       throw std::invalid_argument("strict mode requires aux parameter proof for each participant");
     }
-    if (strict_mode_ && has_aux_proof &&
-        aux_pf_it->second.metadata.scheme == StrictProofScheme::kUnknown) {
-      throw std::invalid_argument("strict mode does not allow legacy aux proof format");
-    }
-    if (has_aux_proof && !VerifyAuxRsaParamProofWeak(aux_it->second, aux_pf_it->second)) {
-      throw std::invalid_argument("aux parameter proof verification failed");
+    if (has_aux_proof) {
+      const StrictProofVerifierContext context = BuildKeygenProofContext(keygen_session_id, party);
+      if (strict_mode_) {
+        if (expected_aux_param_proof_profile_.scheme == StrictProofScheme::kUnknown) {
+          expected_aux_param_proof_profile_ = aux_pf_it->second.metadata;
+        }
+        if (!StrictMetadataCompatible(expected_aux_param_proof_profile_, aux_pf_it->second.metadata)) {
+          throw std::invalid_argument("aux proof metadata is not compatible with strict profile");
+        }
+        if (!VerifyAuxRsaParamProofStrict(aux_it->second, aux_pf_it->second, context)) {
+          throw std::invalid_argument("aux parameter proof verification failed");
+        }
+      } else if (!VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second, context)) {
+        throw std::invalid_argument("aux parameter proof verification failed");
+      }
     }
   }
   const auto self_pk_it = all_paillier_public_.find(self_id());

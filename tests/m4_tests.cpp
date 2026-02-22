@@ -185,6 +185,14 @@ SignFixture BuildSignFixture(const std::vector<PartyIndex>& signers) {
   return fixture;
 }
 
+tecdsa::StrictProofVerifierContext BuildKeygenProofContext(const Bytes& keygen_session_id,
+                                                           PartyIndex prover_id) {
+  tecdsa::StrictProofVerifierContext context;
+  context.session_id = keygen_session_id;
+  context.prover_id = prover_id;
+  return context;
+}
+
 std::vector<SignSessionConfig> BuildSignSessionConfigs(
     const SignFixture& fixture,
     const std::unordered_map<PartyIndex, KeygenResult>& keygen_results,
@@ -260,6 +268,7 @@ std::vector<SignSessionConfig> BuildSignSessionConfigs(
 
     SignSessionConfig cfg;
     cfg.session_id = sign_session_id;
+    cfg.keygen_session_id = baseline_it->second.keygen_session_id;
     cfg.self_id = self_id;
     cfg.participants = fixture.signers;
     cfg.timeout = std::chrono::seconds(10);
@@ -270,6 +279,8 @@ std::vector<SignSessionConfig> BuildSignSessionConfigs(
     cfg.all_aux_rsa_params = aux_params;
     cfg.all_square_free_proofs = square_free_proofs;
     cfg.all_aux_param_proofs = aux_param_proofs;
+    cfg.square_free_proof_profile = baseline_it->second.square_free_proof_profile;
+    cfg.aux_param_proof_profile = baseline_it->second.aux_param_proof_profile;
     cfg.local_paillier = paillier_private.at(self_id);
     cfg.msg32 = fixture.msg32;
     cfg.strict_mode = baseline_it->second.strict_mode;
@@ -684,7 +695,9 @@ void TestStage4Phase2InitUsesResponderOwnedAuxParams() {
          "Responder config must include initiator aux params");
   responder_cfg.all_aux_rsa_params[2] = initiator_aux_it->second;
   responder_cfg.all_aux_param_proofs[2] =
-      tecdsa::BuildAuxRsaParamProof(initiator_aux_it->second);
+      tecdsa::BuildAuxRsaParamProof(
+          initiator_aux_it->second,
+          BuildKeygenProofContext(responder_cfg.keygen_session_id, /*prover_id=*/2));
 
   std::vector<std::unique_ptr<SignSession>> sessions;
   sessions.reserve(configs.size());
@@ -722,7 +735,9 @@ void TestStage4Phase2ResponseUsesInitiatorOwnedAuxParams() {
          "Responder config must include self aux params");
   responder_cfg.all_aux_rsa_params[1] = self_aux_it->second;
   responder_cfg.all_aux_param_proofs[1] =
-      tecdsa::BuildAuxRsaParamProof(self_aux_it->second);
+      tecdsa::BuildAuxRsaParamProof(
+          self_aux_it->second,
+          BuildKeygenProofContext(responder_cfg.keygen_session_id, /*prover_id=*/1));
 
   std::vector<std::unique_ptr<SignSession>> sessions;
   sessions.reserve(configs.size());

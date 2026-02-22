@@ -354,15 +354,21 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
       if (baseline.strict_mode) {
         const auto square_it = current.all_square_free_proofs.find(party_id);
         const auto aux_pf_it = current.all_aux_param_proofs.find(party_id);
+        tecdsa::StrictProofVerifierContext proof_ctx;
+        proof_ctx.session_id = current.keygen_session_id;
+        proof_ctx.prover_id = party_id;
         Expect(square_it != current.all_square_free_proofs.end(),
                "Strict keygen result must include square-free proof for party " +
                    std::to_string(party_id));
         Expect(aux_pf_it != current.all_aux_param_proofs.end(),
                "Strict keygen result must include aux param proof for party " +
                    std::to_string(party_id));
-        Expect(tecdsa::VerifySquareFreeProof(current.all_paillier_public.at(party_id).n, square_it->second),
+        Expect(tecdsa::VerifySquareFreeProof(
+                   current.all_paillier_public.at(party_id).n,
+                   square_it->second,
+                   proof_ctx),
                "Strict keygen result must include a valid square-free proof");
-        Expect(tecdsa::VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second),
+        Expect(tecdsa::VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second, proof_ctx),
                "Strict keygen result must include a valid aux param proof");
       }
     }

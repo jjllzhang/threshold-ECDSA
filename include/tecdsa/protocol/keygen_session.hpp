@@ -40,6 +40,8 @@ struct KeygenSessionConfig {
   uint32_t paillier_modulus_bits = 2048;
   uint32_t aux_rsa_modulus_bits = 2048;
   bool strict_mode = true;
+  ProofMetadata expected_square_free_proof_profile;
+  ProofMetadata expected_aux_param_proof_profile;
   std::chrono::milliseconds timeout = std::chrono::seconds(30);
 };
 
@@ -49,6 +51,7 @@ struct SchnorrProof {
 };
 
 struct KeygenResult {
+  Bytes keygen_session_id;
   Scalar x_i;
   ECPoint X_i;
   ECPoint y;
@@ -58,6 +61,8 @@ struct KeygenResult {
   std::unordered_map<PartyIndex, AuxRsaParams> all_aux_rsa_params;
   std::unordered_map<PartyIndex, SquareFreeProof> all_square_free_proofs;
   std::unordered_map<PartyIndex, AuxRsaParamProof> all_aux_param_proofs;
+  ProofMetadata square_free_proof_profile;
+  ProofMetadata aux_param_proof_profile;
   bool strict_mode = true;
 };
 
@@ -121,6 +126,8 @@ class KeygenSession : public Session {
   uint32_t paillier_modulus_bits_ = 2048;
   uint32_t aux_rsa_modulus_bits_ = 2048;
   bool strict_mode_ = true;
+  ProofMetadata expected_square_free_proof_profile_;
+  ProofMetadata expected_aux_param_proof_profile_;
   std::unordered_set<PartyIndex> peers_;
 
   std::unordered_set<PartyIndex> seen_phase1_;

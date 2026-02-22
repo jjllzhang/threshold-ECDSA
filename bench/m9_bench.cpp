@@ -732,6 +732,7 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
 
     SignSessionConfig cfg;
     cfg.session_id = sign_session_id;
+    cfg.keygen_session_id = baseline_it->second.keygen_session_id;
     cfg.self_id = self_id;
     cfg.participants = signers;
     cfg.timeout = std::chrono::seconds(30);
@@ -742,6 +743,8 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     cfg.all_aux_rsa_params = all_aux_params;
     cfg.all_square_free_proofs = all_square_free_proofs;
     cfg.all_aux_param_proofs = all_aux_param_proofs;
+    cfg.square_free_proof_profile = baseline_it->second.square_free_proof_profile;
+    cfg.aux_param_proof_profile = baseline_it->second.aux_param_proof_profile;
     cfg.local_paillier = local_paillier_keys.at(self_id);
     cfg.msg32 = msg32;
     cfg.strict_mode = true;
