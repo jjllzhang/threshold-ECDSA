@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -18,6 +19,7 @@ namespace {
 
 using tecdsa::Bytes;
 using tecdsa::Envelope;
+using tecdsa::KeygenPhase;
 using tecdsa::KeygenResult;
 using tecdsa::KeygenSession;
 using tecdsa::KeygenSessionConfig;
@@ -59,6 +61,48 @@ struct SignMetrics {
   PhaseMetric phase5d;
   PhaseMetric phase5e;
 };
+
+struct ByteMetric {
+  uint64_t total_bytes = 0;
+  uint64_t samples = 0;
+};
+
+struct StrictProofMetrics {
+  PhaseMetric keygen_phase1_aux_param;
+  PhaseMetric keygen_phase3_square_free;
+  PhaseMetric sign_phase2_a_proofs;
+  PhaseMetric sign_phase4_gamma_schnorr;
+  PhaseMetric sign_phase5b_proofs;
+
+  ByteMetric sign_phase2_a1;
+  ByteMetric sign_phase2_a2;
+  ByteMetric sign_phase2_a3;
+  ByteMetric sign_phase5b_a_schnorr;
+  ByteMetric sign_phase5b_v_relation;
+};
+
+struct SignPhase2ProofBytes {
+  uint64_t a1 = 0;
+  uint64_t a2 = 0;
+  uint64_t a3 = 0;
+
+  uint64_t Total() const {
+    return a1 + a2 + a3;
+  }
+};
+
+struct SignPhase5BProofBytes {
+  uint64_t a_schnorr = 0;
+  uint64_t v_relation = 0;
+
+  uint64_t Total() const {
+    return a_schnorr + v_relation;
+  }
+};
+
+constexpr uint32_t kMtaTypeTimesGamma = 1;
+constexpr uint32_t kMtaTypeTimesW = 2;
+constexpr size_t kCommitmentLen = 32;
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -166,6 +210,209 @@ void RecordMetric(PhaseMetric* metric,
   metric->total_ms += std::chrono::duration<double, std::milli>(end - start).count();
   metric->total_bytes += bytes;
   metric->samples += 1;
+}
+
+void RecordBytesMetric(ByteMetric* metric, uint64_t bytes) {
+  metric->total_bytes += bytes;
+  metric->samples += 1;
+}
+
+double AverageMs(const PhaseMetric& metric) {
+  if (metric.samples == 0) {
+    return 0.0;
+  }
+  return metric.total_ms / static_cast<double>(metric.samples);
+}
+
+double AverageBytes(const PhaseMetric& metric) {
+  if (metric.samples == 0) {
+    return 0.0;
+  }
+  return static_cast<double>(metric.total_bytes) / static_cast<double>(metric.samples);
+}
+
+double AverageBytes(const ByteMetric& metric) {
+  if (metric.samples == 0) {
+    return 0.0;
+  }
+  return static_cast<double>(metric.total_bytes) / static_cast<double>(metric.samples);
+}
+
+size_t ScalarWireSize() {
+  static const size_t kScalarLen = tecdsa::Scalar().ToCanonicalBytes().size();
+  return kScalarLen;
+}
+
+size_t PointWireSize() {
+  static const size_t kPointLen =
+      tecdsa::ECPoint::GeneratorMultiply(tecdsa::Scalar::FromUint64(1)).ToCompressedBytes().size();
+  return kPointLen;
+}
+
+uint32_t ReadU32Be(std::span<const uint8_t> input, size_t* offset) {
+  if (*offset + 4 > input.size()) {
+    throw std::runtime_error("payload underflow while reading u32");
+  }
+  const size_t i = *offset;
+  *offset += 4;
+  return (static_cast<uint32_t>(input[i]) << 24) |
+         (static_cast<uint32_t>(input[i + 1]) << 16) |
+         (static_cast<uint32_t>(input[i + 2]) << 8) |
+         static_cast<uint32_t>(input[i + 3]);
+}
+
+void ConsumeFixedBytes(std::span<const uint8_t> input,
+                       size_t* offset,
+                       size_t len,
+                       const char* field_name) {
+  if (*offset + len > input.size()) {
+    throw std::runtime_error(std::string("payload underflow while reading ") + field_name);
+  }
+  *offset += len;
+}
+
+size_t ConsumeLenPrefixedField(std::span<const uint8_t> input,
+                               size_t* offset,
+                               const char* field_name) {
+  const uint32_t len = ReadU32Be(input, offset);
+  if (*offset + len > input.size()) {
+    throw std::runtime_error(std::string("payload underflow while reading ") + field_name);
+  }
+  *offset += len;
+  return 4 + static_cast<size_t>(len);
+}
+
+uint64_t MeasureKeygenPhase1AuxProofBytes(const std::vector<Envelope>& envelopes) {
+  uint64_t proof_bytes = 0;
+  const uint32_t phase1_type = KeygenSession::MessageTypeForPhase(KeygenPhase::kPhase1);
+  for (const Envelope& envelope : envelopes) {
+    if (envelope.type != phase1_type) {
+      continue;
+    }
+
+    const std::span<const uint8_t> payload(envelope.payload.data(), envelope.payload.size());
+    size_t offset = 0;
+    ConsumeFixedBytes(payload, &offset, kCommitmentLen, "keygen phase1 commitment");
+    for (int i = 0; i < 4; ++i) {
+      ConsumeLenPrefixedField(payload, &offset, "keygen phase1 mpz field");
+    }
+    proof_bytes += ConsumeLenPrefixedField(payload, &offset, "keygen phase1 aux proof");
+    if (offset != payload.size()) {
+      throw std::runtime_error("keygen phase1 payload has trailing bytes in bench parser");
+    }
+  }
+  return proof_bytes;
+}
+
+uint64_t MeasureKeygenPhase3SquareFreeProofBytes(const std::vector<Envelope>& envelopes) {
+  uint64_t proof_bytes = 0;
+  const size_t point_len = PointWireSize();
+  const size_t scalar_len = ScalarWireSize();
+  const uint32_t phase3_type = KeygenSession::MessageTypeForPhase(KeygenPhase::kPhase3);
+  for (const Envelope& envelope : envelopes) {
+    if (envelope.type != phase3_type) {
+      continue;
+    }
+
+    const std::span<const uint8_t> payload(envelope.payload.data(), envelope.payload.size());
+    size_t offset = 0;
+    ConsumeFixedBytes(payload, &offset, point_len, "keygen phase3 X_i");
+    ConsumeFixedBytes(payload, &offset, point_len, "keygen phase3 schnorr.a");
+    ConsumeFixedBytes(payload, &offset, scalar_len, "keygen phase3 schnorr.z");
+    proof_bytes += ConsumeLenPrefixedField(payload, &offset, "keygen phase3 square-free proof");
+    if (offset != payload.size()) {
+      throw std::runtime_error("keygen phase3 payload has trailing bytes in bench parser");
+    }
+  }
+  return proof_bytes;
+}
+
+SignPhase2ProofBytes MeasureSignPhase2ProofBytes(const std::vector<Envelope>& envelopes) {
+  SignPhase2ProofBytes out;
+  const uint32_t init_type = SignSession::MessageTypeForPhase(SignPhase::kPhase2);
+  const uint32_t response_type = SignSession::Phase2ResponseMessageType();
+  for (const Envelope& envelope : envelopes) {
+    if (envelope.type != init_type && envelope.type != response_type) {
+      continue;
+    }
+
+    const std::span<const uint8_t> payload(envelope.payload.data(), envelope.payload.size());
+    size_t offset = 0;
+    const uint32_t mta_type = ReadU32Be(payload, &offset);
+    ConsumeLenPrefixedField(payload, &offset, "sign phase2 instance id");
+    ConsumeLenPrefixedField(payload, &offset, "sign phase2 ciphertext");
+    const uint64_t proof_bytes = static_cast<uint64_t>(payload.size() - offset);
+
+    if (envelope.type == init_type) {
+      out.a1 += proof_bytes;
+      continue;
+    }
+    if (mta_type == kMtaTypeTimesGamma) {
+      out.a3 += proof_bytes;
+      continue;
+    }
+    if (mta_type == kMtaTypeTimesW) {
+      out.a2 += proof_bytes;
+      continue;
+    }
+    throw std::runtime_error("unknown sign phase2 MtA type in bench parser");
+  }
+  return out;
+}
+
+uint64_t MeasureSignPhase4GammaSchnorrProofBytes(const std::vector<Envelope>& envelopes) {
+  uint64_t proof_bytes = 0;
+  const size_t point_len = PointWireSize();
+  const uint32_t phase4_type = SignSession::MessageTypeForPhase(SignPhase::kPhase4);
+  for (const Envelope& envelope : envelopes) {
+    if (envelope.type != phase4_type) {
+      continue;
+    }
+
+    const std::span<const uint8_t> payload(envelope.payload.data(), envelope.payload.size());
+    size_t offset = 0;
+    ConsumeFixedBytes(payload, &offset, point_len, "sign phase4 gamma");
+    ConsumeLenPrefixedField(payload, &offset, "sign phase4 open randomness");
+    const size_t proof_offset = offset;
+    ConsumeFixedBytes(payload, &offset, point_len, "sign phase4 schnorr.a");
+    ConsumeFixedBytes(payload, &offset, ScalarWireSize(), "sign phase4 schnorr.z");
+    if (offset != payload.size()) {
+      throw std::runtime_error("sign phase4 payload has trailing bytes in bench parser");
+    }
+    proof_bytes += static_cast<uint64_t>(payload.size() - proof_offset);
+  }
+  return proof_bytes;
+}
+
+SignPhase5BProofBytes MeasureSignPhase5BProofBytes(const std::vector<Envelope>& envelopes) {
+  SignPhase5BProofBytes out;
+  const size_t point_len = PointWireSize();
+  const size_t scalar_len = ScalarWireSize();
+  const uint32_t phase5b_type = SignSession::MessageTypeForPhase5Stage(SignPhase5Stage::kPhase5B);
+  for (const Envelope& envelope : envelopes) {
+    if (envelope.type != phase5b_type) {
+      continue;
+    }
+
+    const std::span<const uint8_t> payload(envelope.payload.data(), envelope.payload.size());
+    size_t offset = 0;
+    ConsumeFixedBytes(payload, &offset, point_len, "sign phase5B V_i");
+    ConsumeFixedBytes(payload, &offset, point_len, "sign phase5B A_i");
+    ConsumeLenPrefixedField(payload, &offset, "sign phase5B open randomness");
+    const size_t schnorr_offset = offset;
+    ConsumeFixedBytes(payload, &offset, point_len, "sign phase5B A schnorr.a");
+    ConsumeFixedBytes(payload, &offset, scalar_len, "sign phase5B A schnorr.z");
+    const size_t relation_offset = offset;
+    ConsumeFixedBytes(payload, &offset, point_len, "sign phase5B relation.alpha");
+    ConsumeFixedBytes(payload, &offset, scalar_len, "sign phase5B relation.t");
+    ConsumeFixedBytes(payload, &offset, scalar_len, "sign phase5B relation.u");
+    if (offset != payload.size()) {
+      throw std::runtime_error("sign phase5B payload has trailing bytes in bench parser");
+    }
+    out.a_schnorr += static_cast<uint64_t>(relation_offset - schnorr_offset);
+    out.v_relation += static_cast<uint64_t>(payload.size() - relation_offset);
+  }
+  return out;
 }
 
 bool DeliverKeygenEnvelope(const Envelope& envelope,
@@ -355,7 +602,8 @@ std::vector<std::unique_ptr<KeygenSession>> BuildKeygenSessions(const BenchArgs&
 
 std::unordered_map<PartyIndex, KeygenResult> RunKeygenRound(const BenchArgs& args,
                                                             uint32_t iteration,
-                                                            KeygenMetrics* metrics) {
+                                                            KeygenMetrics* metrics,
+                                                            StrictProofMetrics* strict_metrics) {
   auto sessions = BuildKeygenSessions(args, MakeSessionId(0xA1, iteration));
 
   {
@@ -366,9 +614,13 @@ std::unordered_map<PartyIndex, KeygenResult> RunKeygenRound(const BenchArgs& arg
       phase1.push_back(session->BuildPhase1CommitEnvelope());
     }
     const uint64_t bytes = MeasureEnvelopeBytes(phase1);
+    const uint64_t aux_proof_bytes = MeasureKeygenPhase1AuxProofBytes(phase1);
     DeliverKeygenOrThrow(phase1, &sessions);
     const auto end = std::chrono::steady_clock::now();
     RecordMetric(&metrics->phase1, start, end, bytes);
+    if (strict_metrics != nullptr) {
+      RecordMetric(&strict_metrics->keygen_phase1_aux_param, start, end, aux_proof_bytes);
+    }
   }
 
   {
@@ -392,9 +644,13 @@ std::unordered_map<PartyIndex, KeygenResult> RunKeygenRound(const BenchArgs& arg
       phase3.push_back(session->BuildPhase3XiProofEnvelope());
     }
     const uint64_t bytes = MeasureEnvelopeBytes(phase3);
+    const uint64_t square_free_bytes = MeasureKeygenPhase3SquareFreeProofBytes(phase3);
     DeliverKeygenOrThrow(phase3, &sessions);
     const auto end = std::chrono::steady_clock::now();
     RecordMetric(&metrics->phase3, start, end, bytes);
+    if (strict_metrics != nullptr) {
+      RecordMetric(&strict_metrics->keygen_phase3_square_free, start, end, square_free_bytes);
+    }
   }
 
   std::unordered_map<PartyIndex, KeygenResult> out;
@@ -498,7 +754,8 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
 void RunSignRound(const std::unordered_map<PartyIndex, KeygenResult>& keygen_results,
                   const std::vector<PartyIndex>& signers,
                   uint32_t iteration,
-                  SignMetrics* metrics) {
+                  SignMetrics* metrics,
+                  StrictProofMetrics* strict_metrics) {
   auto sessions = BuildSignSessions(
       signers, keygen_results, MakeSessionId(0xB1, iteration), tecdsa::Csprng::RandomBytes(32));
 
@@ -514,12 +771,17 @@ void RunSignRound(const std::unordered_map<PartyIndex, KeygenResult>& keygen_res
   {
     const auto start = std::chrono::steady_clock::now();
     uint64_t bytes = 0;
+    SignPhase2ProofBytes phase2_proof_bytes;
     for (size_t round = 0; round < 64; ++round) {
       std::vector<Envelope> phase2 = CollectSignPhase2(&sessions);
       if (phase2.empty()) {
         throw std::runtime_error("sign phase2 stalled");
       }
       bytes += MeasureEnvelopeBytes(phase2);
+      const SignPhase2ProofBytes batch_proof_bytes = MeasureSignPhase2ProofBytes(phase2);
+      phase2_proof_bytes.a1 += batch_proof_bytes.a1;
+      phase2_proof_bytes.a2 += batch_proof_bytes.a2;
+      phase2_proof_bytes.a3 += batch_proof_bytes.a3;
       DeliverSignOrThrow(phase2, signers, &sessions);
       if (AllSignSessionsInPhase(sessions, SignPhase::kPhase3)) {
         break;
@@ -528,6 +790,12 @@ void RunSignRound(const std::unordered_map<PartyIndex, KeygenResult>& keygen_res
     Expect(AllSignSessionsInPhase(sessions, SignPhase::kPhase3), "sign did not finish phase2");
     const auto end = std::chrono::steady_clock::now();
     RecordMetric(&metrics->phase2, start, end, bytes);
+    if (strict_metrics != nullptr) {
+      RecordMetric(&strict_metrics->sign_phase2_a_proofs, start, end, phase2_proof_bytes.Total());
+      RecordBytesMetric(&strict_metrics->sign_phase2_a1, phase2_proof_bytes.a1);
+      RecordBytesMetric(&strict_metrics->sign_phase2_a2, phase2_proof_bytes.a2);
+      RecordBytesMetric(&strict_metrics->sign_phase2_a3, phase2_proof_bytes.a3);
+    }
   }
 
   {
@@ -544,11 +812,15 @@ void RunSignRound(const std::unordered_map<PartyIndex, KeygenResult>& keygen_res
     const auto start = std::chrono::steady_clock::now();
     std::vector<Envelope> phase4 = CollectSignPhase4(&sessions);
     const uint64_t bytes = MeasureEnvelopeBytes(phase4);
+    const uint64_t proof_bytes = MeasureSignPhase4GammaSchnorrProofBytes(phase4);
     DeliverSignOrThrow(phase4, signers, &sessions);
     Expect(AllSignSessionsInPhase(sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5A),
            "sign did not advance to phase5A");
     const auto end = std::chrono::steady_clock::now();
     RecordMetric(&metrics->phase4, start, end, bytes);
+    if (strict_metrics != nullptr) {
+      RecordMetric(&strict_metrics->sign_phase4_gamma_schnorr, start, end, proof_bytes);
+    }
   }
 
   {
@@ -566,11 +838,17 @@ void RunSignRound(const std::unordered_map<PartyIndex, KeygenResult>& keygen_res
     const auto start = std::chrono::steady_clock::now();
     std::vector<Envelope> phase5b = CollectSignPhase5B(&sessions);
     const uint64_t bytes = MeasureEnvelopeBytes(phase5b);
+    const SignPhase5BProofBytes proof_bytes = MeasureSignPhase5BProofBytes(phase5b);
     DeliverSignOrThrow(phase5b, signers, &sessions);
     Expect(AllSignSessionsInPhase(sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5C),
            "sign did not advance to phase5C");
     const auto end = std::chrono::steady_clock::now();
     RecordMetric(&metrics->phase5b, start, end, bytes);
+    if (strict_metrics != nullptr) {
+      RecordMetric(&strict_metrics->sign_phase5b_proofs, start, end, proof_bytes.Total());
+      RecordBytesMetric(&strict_metrics->sign_phase5b_a_schnorr, proof_bytes.a_schnorr);
+      RecordBytesMetric(&strict_metrics->sign_phase5b_v_relation, proof_bytes.v_relation);
+    }
   }
 
   {
@@ -611,8 +889,8 @@ void RunSignRound(const std::unordered_map<PartyIndex, KeygenResult>& keygen_res
 }
 
 void PrintMetricLine(const std::string& name, const PhaseMetric& metric) {
-  const double avg_ms = metric.total_ms / static_cast<double>(metric.samples);
-  const double avg_bytes = static_cast<double>(metric.total_bytes) / static_cast<double>(metric.samples);
+  const double avg_ms = AverageMs(metric);
+  const double avg_bytes = AverageBytes(metric);
   std::cout << std::left << std::setw(14) << name << "  "
             << std::right << std::setw(12) << std::fixed << std::setprecision(3) << avg_ms << "  "
             << std::setw(14) << std::fixed << std::setprecision(1) << avg_bytes << '\n';
@@ -644,6 +922,86 @@ void PrintSignSummary(const SignMetrics& metrics) {
   PrintMetricLine("phase5E", metrics.phase5e);
 }
 
+void PrintStrictProofMetricLine(const std::string& component,
+                                const PhaseMetric& proof_metric,
+                                const PhaseMetric& phase_metric) {
+  const double avg_ms = AverageMs(proof_metric);
+  const double avg_proof_bytes = AverageBytes(proof_metric);
+  const double avg_phase_bytes = AverageBytes(phase_metric);
+  const double proof_ratio = (avg_phase_bytes > 0.0) ? (avg_proof_bytes * 100.0 / avg_phase_bytes) : 0.0;
+  std::cout << std::left << std::setw(24) << component << "  "
+            << std::right << std::setw(12) << std::fixed << std::setprecision(3) << avg_ms << "  "
+            << std::setw(16) << std::fixed << std::setprecision(1) << avg_proof_bytes << "  "
+            << std::setw(15) << std::fixed << std::setprecision(2) << proof_ratio << '\n';
+}
+
+void PrintByteMetricLine(const std::string& component, const ByteMetric& metric) {
+  const double avg_bytes = AverageBytes(metric);
+  std::cout << std::left << std::setw(24) << component << "  "
+            << std::right << std::setw(16) << std::fixed << std::setprecision(1) << avg_bytes << '\n';
+}
+
+void PrintStrictProofSummary(const StrictProofMetrics& strict_metrics,
+                             const KeygenMetrics& keygen_metrics,
+                             const SignMetrics& sign_metrics) {
+  std::cout << "\n[Strict-Proof Attribution]\n";
+  std::cout << std::left << std::setw(24) << "Component"
+            << "  " << std::right << std::setw(12) << "Avg ms"
+            << "  " << std::setw(16) << "Proof bytes"
+            << "  " << std::setw(15) << "Proof bytes %\n";
+
+  PrintStrictProofMetricLine(
+      "keygen.phase1 aux", strict_metrics.keygen_phase1_aux_param, keygen_metrics.phase1);
+  PrintStrictProofMetricLine(
+      "keygen.phase3 square", strict_metrics.keygen_phase3_square_free, keygen_metrics.phase3);
+  PrintStrictProofMetricLine(
+      "sign.phase2 A1/A2/A3", strict_metrics.sign_phase2_a_proofs, sign_metrics.phase2);
+  PrintStrictProofMetricLine(
+      "sign.phase4 schnorr", strict_metrics.sign_phase4_gamma_schnorr, sign_metrics.phase4);
+  PrintStrictProofMetricLine(
+      "sign.phase5B proofs", strict_metrics.sign_phase5b_proofs, sign_metrics.phase5b);
+
+  const double keygen_strict_avg_ms =
+      AverageMs(strict_metrics.keygen_phase1_aux_param) + AverageMs(strict_metrics.keygen_phase3_square_free);
+  const double keygen_strict_avg_bytes =
+      AverageBytes(strict_metrics.keygen_phase1_aux_param) + AverageBytes(strict_metrics.keygen_phase3_square_free);
+  const double keygen_total_avg_bytes =
+      AverageBytes(keygen_metrics.phase1) + AverageBytes(keygen_metrics.phase2) + AverageBytes(keygen_metrics.phase3);
+  const double keygen_ratio =
+      (keygen_total_avg_bytes > 0.0) ? (keygen_strict_avg_bytes * 100.0 / keygen_total_avg_bytes) : 0.0;
+
+  const double sign_strict_avg_ms =
+      AverageMs(strict_metrics.sign_phase2_a_proofs) + AverageMs(strict_metrics.sign_phase4_gamma_schnorr) +
+      AverageMs(strict_metrics.sign_phase5b_proofs);
+  const double sign_strict_avg_bytes =
+      AverageBytes(strict_metrics.sign_phase2_a_proofs) + AverageBytes(strict_metrics.sign_phase4_gamma_schnorr) +
+      AverageBytes(strict_metrics.sign_phase5b_proofs);
+  const double sign_total_avg_bytes =
+      AverageBytes(sign_metrics.phase1) + AverageBytes(sign_metrics.phase2) + AverageBytes(sign_metrics.phase3) +
+      AverageBytes(sign_metrics.phase4) + AverageBytes(sign_metrics.phase5a) + AverageBytes(sign_metrics.phase5b) +
+      AverageBytes(sign_metrics.phase5c) + AverageBytes(sign_metrics.phase5d) + AverageBytes(sign_metrics.phase5e);
+  const double sign_ratio =
+      (sign_total_avg_bytes > 0.0) ? (sign_strict_avg_bytes * 100.0 / sign_total_avg_bytes) : 0.0;
+
+  std::cout << std::left << std::setw(24) << "keygen strict subtotal"
+            << "  " << std::right << std::setw(12) << std::fixed << std::setprecision(3) << keygen_strict_avg_ms
+            << "  " << std::setw(16) << std::fixed << std::setprecision(1) << keygen_strict_avg_bytes << "  "
+            << std::setw(15) << std::fixed << std::setprecision(2) << keygen_ratio << '\n';
+  std::cout << std::left << std::setw(24) << "sign strict subtotal"
+            << "  " << std::right << std::setw(12) << std::fixed << std::setprecision(3) << sign_strict_avg_ms
+            << "  " << std::setw(16) << std::fixed << std::setprecision(1) << sign_strict_avg_bytes << "  "
+            << std::setw(15) << std::fixed << std::setprecision(2) << sign_ratio << '\n';
+
+  std::cout << "\n[Strict-Proof Byte Detail]\n";
+  std::cout << std::left << std::setw(24) << "Component"
+            << "  " << std::right << std::setw(16) << "Avg bytes\n";
+  PrintByteMetricLine("sign.phase2 A1", strict_metrics.sign_phase2_a1);
+  PrintByteMetricLine("sign.phase2 A2", strict_metrics.sign_phase2_a2);
+  PrintByteMetricLine("sign.phase2 A3", strict_metrics.sign_phase2_a3);
+  PrintByteMetricLine("sign.phase5B schnorr", strict_metrics.sign_phase5b_a_schnorr);
+  PrintByteMetricLine("sign.phase5B relation", strict_metrics.sign_phase5b_v_relation);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -656,9 +1014,10 @@ int main(int argc, char** argv) {
               << ", paillier_bits=" << args.paillier_bits << '\n';
 
     KeygenMetrics keygen_metrics;
+    StrictProofMetrics strict_metrics;
     std::unordered_map<PartyIndex, KeygenResult> baseline_keygen_results;
     for (uint32_t i = 0; i < args.keygen_iters; ++i) {
-      baseline_keygen_results = RunKeygenRound(args, i, &keygen_metrics);
+      baseline_keygen_results = RunKeygenRound(args, i, &keygen_metrics, &strict_metrics);
     }
 
     std::vector<PartyIndex> signers;
@@ -669,11 +1028,12 @@ int main(int argc, char** argv) {
 
     SignMetrics sign_metrics;
     for (uint32_t i = 0; i < args.sign_iters; ++i) {
-      RunSignRound(baseline_keygen_results, signers, i, &sign_metrics);
+      RunSignRound(baseline_keygen_results, signers, i, &sign_metrics, &strict_metrics);
     }
 
     PrintKeygenSummary(keygen_metrics);
     PrintSignSummary(sign_metrics);
+    PrintStrictProofSummary(strict_metrics, keygen_metrics, sign_metrics);
   } catch (const std::exception& ex) {
     std::cerr << "benchmark failed: " << ex.what() << '\n';
     return 1;

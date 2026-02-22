@@ -109,6 +109,23 @@ ctest --test-dir build --output-on-failure
 ./build/m9_bench --n 5 --t 2 --keygen-iters 1 --sign-iters 20
 ```
 
+`m9_bench` 输出包含两类统计：
+- Keygen/Sign 各 phase 的平均耗时与总带宽。
+- strict-proof 归因拆分（aux/square-free/A.1-A.3/Phase4 Schnorr/Phase5B 证明）的平均耗时与带宽。
+
+## Full-Spec STRICT 状态（2026-02-22）
+
+对照 `gg2019_threshold_ecdsa_full_impl_spec.md` 的 Part C.1（必须项）：
+
+- [x] secp256k1 点/标量运算、Paillier Enc/Dec+同态、`N > q^8` 检查。
+- [x] KeyGen Feldman VSS、`X_i` Schnorr；Sign `Γ_i/A_i` Schnorr 与 Phase5B 关系证明。
+- [x] 附录 A（A.1/A.2/A.3）字段/范围/绑定与失败即中止。
+- [x] Phase5D 检查与 abort 规则、最终 ECDSA verify、严格输入校验。
+- [~] KeyGen `N` square-free proof（[21]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/SquareFreeDevDigest/v1` 开发版绑定证明，不是 [21] 完整构造。
+- [~] Aux 参数 `Ñ,h1,h2` 证明（[14]）：已具备 strict 门禁与对抗测试，但当前实现是 `GG2019/AuxParamDevDigest/v1` 开发版绑定证明，不是 [14]/可信 CRS 的完整构造。
+
+结论：当前仓库实现了 strict 工程门禁与大部分协议强制项，但尚未达到 full-spec [21]/[14] 口径的“完全 STRICT 合规”。
+
 ## 使用边界与注意事项
 
 - 当前网络层仅有内存传输实现，未包含真实网络协议、鉴权、重传或持久化。
