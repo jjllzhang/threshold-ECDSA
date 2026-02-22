@@ -29,51 +29,6 @@ using tecdsa::SignPhase5Stage;
 using tecdsa::SignSession;
 using tecdsa::SignSessionConfig;
 
-std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> BuildAuxParamsFromPaillier(
-    const std::vector<PartyIndex>& signers,
-    const std::unordered_map<PartyIndex, tecdsa::PaillierPublicKey>& paillier_public) {
-  std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> out;
-  out.reserve(signers.size());
-
-  auto pick_coprime = [](const mpz_class& modulus, const mpz_class& seed) {
-    mpz_class value = seed % modulus;
-    if (value < 2) {
-      value = 2;
-    }
-    while (true) {
-      if (value >= modulus) {
-        value = 2;
-      }
-      mpz_class gcd;
-      mpz_gcd(gcd.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t());
-      if (gcd == 1) {
-        return value;
-      }
-      ++value;
-    }
-  };
-
-  for (PartyIndex party : signers) {
-    const auto pub_it = paillier_public.find(party);
-    if (pub_it == paillier_public.end()) {
-      throw std::runtime_error("missing Paillier public key while building aux params");
-    }
-    const mpz_class n_tilde = pub_it->second.n;
-    const mpz_class h1 = pick_coprime(n_tilde, mpz_class(2 + 2 * party));
-    mpz_class h2 = pick_coprime(n_tilde, mpz_class(3 + 2 * party));
-    if (h2 == h1) {
-      h2 = pick_coprime(n_tilde, h1 + 1);
-    }
-    out.emplace(party, SignSessionConfig::AuxRsaParams{
-                          .n_tilde = n_tilde,
-                          .h1 = h1,
-                          .h2 = h2,
-                      });
-  }
-
-  return out;
-}
-
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error("Test failed: " + message);
@@ -252,8 +207,14 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
 
   std::unordered_map<PartyIndex, std::shared_ptr<tecdsa::PaillierProvider>> paillier_private;
   std::unordered_map<PartyIndex, tecdsa::PaillierPublicKey> paillier_public;
+  std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> aux_params;
+  std::unordered_map<PartyIndex, SignSessionConfig::SquareFreeProof> square_free_proofs;
+  std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParamProof> aux_param_proofs;
   paillier_private.reserve(fixture.signers.size());
   paillier_public.reserve(fixture.signers.size());
+  aux_params.reserve(fixture.signers.size());
+  square_free_proofs.reserve(fixture.signers.size());
+  aux_param_proofs.reserve(fixture.signers.size());
   for (PartyIndex party : fixture.signers) {
     const auto party_result_it = keygen_results.find(party);
     if (party_result_it == keygen_results.end()) {
@@ -269,8 +230,25 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
 
     paillier_public.emplace(party, paillier_pub_it->second);
     paillier_private.emplace(party, party_result_it->second.local_paillier);
+
+    const auto aux_it = baseline_it->second.all_aux_rsa_params.find(party);
+    if (aux_it == baseline_it->second.all_aux_rsa_params.end()) {
+      throw std::runtime_error("missing signer aux params in keygen baseline");
+    }
+    aux_params.emplace(party, aux_it->second);
+
+    const auto square_it = baseline_it->second.all_square_free_proofs.find(party);
+    if (square_it == baseline_it->second.all_square_free_proofs.end()) {
+      throw std::runtime_error("missing signer square-free proof in keygen baseline");
+    }
+    square_free_proofs.emplace(party, square_it->second);
+
+    const auto aux_pf_it = baseline_it->second.all_aux_param_proofs.find(party);
+    if (aux_pf_it == baseline_it->second.all_aux_param_proofs.end()) {
+      throw std::runtime_error("missing signer aux param proof in keygen baseline");
+    }
+    aux_param_proofs.emplace(party, aux_pf_it->second);
   }
-  const auto aux_params = BuildAuxParamsFromPaillier(fixture.signers, paillier_public);
 
   for (PartyIndex self_id : fixture.signers) {
     const auto keygen_it = keygen_results.find(self_id);
@@ -288,8 +266,11 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     cfg.all_X_i = all_X_i_subset;
     cfg.all_paillier_public = paillier_public;
     cfg.all_aux_rsa_params = aux_params;
+    cfg.all_square_free_proofs = square_free_proofs;
+    cfg.all_aux_param_proofs = aux_param_proofs;
     cfg.local_paillier = paillier_private.at(self_id);
     cfg.msg32 = fixture.msg32;
+    cfg.strict_mode = baseline_it->second.strict_mode;
     cfg.fixed_k_i = fixture.fixed_k.at(self_id);
     cfg.fixed_gamma_i = fixture.fixed_gamma.at(self_id);
 

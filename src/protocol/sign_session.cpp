@@ -277,14 +277,8 @@ bool IsZnStarElement(const mpz_class& value, const mpz_class& modulus) {
 }
 
 void ValidateAuxRsaParamsOrThrow(const AuxRsaParams& params) {
-  if (params.n_tilde <= 2) {
-    throw std::invalid_argument("aux RSA Ntilde must be > 2");
-  }
-  if (!IsZnStarElement(params.h1, params.n_tilde)) {
-    throw std::invalid_argument("aux RSA h1 must be in Z*_Ntilde");
-  }
-  if (!IsZnStarElement(params.h2, params.n_tilde)) {
-    throw std::invalid_argument("aux RSA h2 must be in Z*_Ntilde");
+  if (!ValidateAuxRsaParams(params)) {
+    throw std::invalid_argument("invalid aux RSA parameters");
   }
 }
 
@@ -1129,7 +1123,10 @@ SignSession::SignSession(SignSessionConfig cfg)
       all_X_i_(std::move(cfg.all_X_i)),
       all_paillier_public_(std::move(cfg.all_paillier_public)),
       all_aux_rsa_params_(std::move(cfg.all_aux_rsa_params)),
+      all_square_free_proofs_(std::move(cfg.all_square_free_proofs)),
+      all_aux_param_proofs_(std::move(cfg.all_aux_param_proofs)),
       local_paillier_(std::move(cfg.local_paillier)),
+      strict_mode_(cfg.strict_mode),
       local_x_i_(cfg.x_i),
       public_key_y_(cfg.y),
       msg32_(std::move(cfg.msg32)),
@@ -1164,6 +1161,26 @@ SignSession::SignSession(SignSessionConfig cfg)
       throw std::invalid_argument("all_aux_rsa_params is missing participant params");
     }
     ValidateAuxRsaParamsOrThrow(aux_it->second);
+
+    const auto square_it = all_square_free_proofs_.find(party);
+    const bool has_square_proof =
+        square_it != all_square_free_proofs_.end() && !square_it->second.blob.empty();
+    if (strict_mode_ && !has_square_proof) {
+      throw std::invalid_argument("strict mode requires square-free proof for each participant");
+    }
+    if (has_square_proof && !VerifySquareFreeProof(paillier_it->second.n, square_it->second)) {
+      throw std::invalid_argument("square-free proof verification failed");
+    }
+
+    const auto aux_pf_it = all_aux_param_proofs_.find(party);
+    const bool has_aux_proof =
+        aux_pf_it != all_aux_param_proofs_.end() && !aux_pf_it->second.blob.empty();
+    if (strict_mode_ && !has_aux_proof) {
+      throw std::invalid_argument("strict mode requires aux parameter proof for each participant");
+    }
+    if (has_aux_proof && !VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second)) {
+      throw std::invalid_argument("aux parameter proof verification failed");
+    }
   }
   const auto self_pk_it = all_paillier_public_.find(self_id());
   if (self_pk_it == all_paillier_public_.end()) {

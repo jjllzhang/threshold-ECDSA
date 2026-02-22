@@ -7,6 +7,7 @@
 - 曲线与标量运算：基于 `libsecp256k1` 封装 `Scalar` / `ECPoint`
 - Paillier 同态加密：基于 `libhcs` 封装 `PaillierProvider`
 - 密码学基础组件：SHA-256/SHA-512、承诺、转录挑战、定长/变长编码
+- STRICT 证明模块：square-free/aux 参数证明接口与 strict/dev 门禁
 - 协议会话框架：统一 `Session` 生命周期（运行、完成、中止、超时）
 - 网络抽象：`ITransport` + `InMemoryTransport` + `SessionRouter`
 - 阈值密钥生成（Keygen）：3 阶段广播/点对点混合流程
@@ -24,11 +25,13 @@
   - In-memory 传输
   - SessionRouter 过滤与分发
   - Keygen/Sign 骨架推进与超时处理
+  - strict/dev 缺 proof 行为分流
 - `m3_tests`：Keygen 完整流程
   - `n=3,t=1` 与 `n=5,t=2` 一致性
   - Feldman share 校验
   - Schnorr 证明校验
   - Paillier 公钥约束 `N > q^8`
+  - Phase1 的 square-free/aux proof strict 校验
   - 篡改消息触发中止
 - `m4_tests`：Sign 完整流程与故障路径
   - 端到端生成并验证 `(r,s)`

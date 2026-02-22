@@ -37,6 +37,7 @@ add_library(tecdsa_m0
   src/crypto/commitment.cpp
   src/crypto/encoding.cpp
   src/crypto/paillier.cpp
+  src/crypto/strict_proofs.cpp
   src/crypto/transcript.cpp
   src/net/envelope.cpp
   src/net/in_memory_transport.cpp

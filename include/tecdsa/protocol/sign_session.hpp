@@ -10,6 +10,7 @@
 #include "tecdsa/crypto/ec_point.hpp"
 #include "tecdsa/crypto/paillier.hpp"
 #include "tecdsa/crypto/scalar.hpp"
+#include "tecdsa/crypto/strict_proofs.hpp"
 #include "tecdsa/net/envelope.hpp"
 #include "tecdsa/protocol/session.hpp"
 
@@ -48,11 +49,9 @@ enum class SignMessageType : uint32_t {
 };
 
 struct SignSessionConfig {
-  struct AuxRsaParams {
-    mpz_class n_tilde;
-    mpz_class h1;
-    mpz_class h2;
-  };
+  using AuxRsaParams = tecdsa::AuxRsaParams;
+  using SquareFreeProof = tecdsa::SquareFreeProof;
+  using AuxRsaParamProof = tecdsa::AuxRsaParamProof;
 
   Bytes session_id;
   PartyIndex self_id = 0;
@@ -64,8 +63,11 @@ struct SignSessionConfig {
   std::unordered_map<PartyIndex, ECPoint> all_X_i;
   std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public;
   std::unordered_map<PartyIndex, AuxRsaParams> all_aux_rsa_params;
+  std::unordered_map<PartyIndex, SquareFreeProof> all_square_free_proofs;
+  std::unordered_map<PartyIndex, AuxRsaParamProof> all_aux_param_proofs;
   std::shared_ptr<PaillierProvider> local_paillier;
   Bytes msg32;
+  bool strict_mode = true;
 
   std::optional<Scalar> fixed_k_i;
   std::optional<Scalar> fixed_gamma_i;
@@ -204,7 +206,10 @@ class SignSession : public Session {
   std::unordered_map<PartyIndex, ECPoint> all_X_i_;
   std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public_;
   std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> all_aux_rsa_params_;
+  std::unordered_map<PartyIndex, SignSessionConfig::SquareFreeProof> all_square_free_proofs_;
+  std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParamProof> all_aux_param_proofs_;
   std::shared_ptr<PaillierProvider> local_paillier_;
+  bool strict_mode_ = true;
 
   Scalar local_x_i_;
   ECPoint public_key_y_;

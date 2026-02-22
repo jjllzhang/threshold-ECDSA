@@ -34,40 +34,12 @@ std::unordered_map<tecdsa::PartyIndex, SignSessionConfig::AuxRsaParams> BuildAux
   std::unordered_map<tecdsa::PartyIndex, SignSessionConfig::AuxRsaParams> out;
   out.reserve(participants.size());
 
-  auto pick_coprime = [](const mpz_class& modulus, const mpz_class& seed) {
-    mpz_class value = seed % modulus;
-    if (value < 2) {
-      value = 2;
-    }
-    while (true) {
-      if (value >= modulus) {
-        value = 2;
-      }
-      mpz_class gcd;
-      mpz_gcd(gcd.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t());
-      if (gcd == 1) {
-        return value;
-      }
-      ++value;
-    }
-  };
-
   for (tecdsa::PartyIndex party : participants) {
     const auto pub_it = paillier_public.find(party);
     if (pub_it == paillier_public.end()) {
       throw std::runtime_error("missing Paillier public key while building aux params");
     }
-    const mpz_class n_tilde = pub_it->second.n;
-    const mpz_class h1 = pick_coprime(n_tilde, mpz_class(2 + 2 * party));
-    mpz_class h2 = pick_coprime(n_tilde, mpz_class(3 + 2 * party));
-    if (h2 == h1) {
-      h2 = pick_coprime(n_tilde, h1 + 1);
-    }
-    out.emplace(party, SignSessionConfig::AuxRsaParams{
-                          .n_tilde = n_tilde,
-                          .h1 = h1,
-                          .h2 = h2,
-                      });
+    out.emplace(party, tecdsa::DeriveAuxRsaParamsFromModulus(pub_it->second.n, party));
   }
 
   return out;
@@ -208,6 +180,17 @@ void TestSignSessionSkeletonAndTimeout() {
   paillier_public.emplace(1, PaillierPublicKey{.n = paillier_1->modulus_n()});
   paillier_public.emplace(2, PaillierPublicKey{.n = paillier_2->modulus_n()});
   const auto aux_params = BuildAuxParamsFromPaillier(participants, paillier_public);
+  std::unordered_map<tecdsa::PartyIndex, SignSessionConfig::SquareFreeProof> square_free_proofs;
+  std::unordered_map<tecdsa::PartyIndex, SignSessionConfig::AuxRsaParamProof> aux_param_proofs;
+  for (tecdsa::PartyIndex party : participants) {
+    const auto pub_it = paillier_public.find(party);
+    const auto aux_it = aux_params.find(party);
+    if (pub_it == paillier_public.end() || aux_it == aux_params.end()) {
+      throw std::runtime_error("failed to build strict proofs for sign skeleton");
+    }
+    square_free_proofs.emplace(party, tecdsa::BuildSquareFreeProof(pub_it->second.n));
+    aux_param_proofs.emplace(party, tecdsa::BuildAuxRsaParamProof(aux_it->second));
+  }
 
   auto build_cfg = [&](tecdsa::PartyIndex self_id,
                        uint64_t x_i_value,
@@ -226,6 +209,8 @@ void TestSignSessionSkeletonAndTimeout() {
     cfg.all_X_i = all_x_i;
     cfg.all_paillier_public = paillier_public;
     cfg.all_aux_rsa_params = aux_params;
+    cfg.all_square_free_proofs = square_free_proofs;
+    cfg.all_aux_param_proofs = aux_param_proofs;
     cfg.local_paillier = std::move(local_paillier);
     cfg.msg32 = Bytes{
         0x4d, 0x32, 0x2d, 0x73, 0x69, 0x67, 0x6e, 0x2d,
@@ -233,6 +218,7 @@ void TestSignSessionSkeletonAndTimeout() {
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
         0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
     };
+    cfg.strict_mode = true;
     cfg.fixed_k_i = Scalar::FromUint64(fixed_k);
     cfg.fixed_gamma_i = Scalar::FromUint64(fixed_gamma);
     return cfg;
@@ -361,6 +347,32 @@ void TestSignSessionSkeletonAndTimeout() {
   Expect(timeout_session.PollTimeout(far_future), "PollTimeout should trigger timeout status");
   Expect(timeout_session.status() == SessionStatus::kTimedOut,
          "Session status should be timed out after deadline");
+
+  SignSessionConfig strict_missing_proof_cfg = build_cfg(/*self_id=*/1,
+                                                         /*x_i_value=*/3,
+                                                         /*fixed_k=*/11,
+                                                         /*fixed_gamma=*/22,
+                                                         Bytes{4, 4, 4},
+                                                         std::chrono::seconds(5),
+                                                         paillier_1);
+  strict_missing_proof_cfg.all_square_free_proofs.clear();
+  strict_missing_proof_cfg.all_aux_param_proofs.clear();
+  ExpectThrow([&]() { (void)SignSession(std::move(strict_missing_proof_cfg)); },
+              "strict mode sign session must reject missing square-free/aux proofs");
+
+  SignSessionConfig dev_missing_proof_cfg = build_cfg(/*self_id=*/1,
+                                                      /*x_i_value=*/3,
+                                                      /*fixed_k=*/11,
+                                                      /*fixed_gamma=*/22,
+                                                      Bytes{5, 5, 5},
+                                                      std::chrono::seconds(5),
+                                                      paillier_1);
+  dev_missing_proof_cfg.strict_mode = false;
+  dev_missing_proof_cfg.all_square_free_proofs.clear();
+  dev_missing_proof_cfg.all_aux_param_proofs.clear();
+  SignSession dev_session(std::move(dev_missing_proof_cfg));
+  Expect(dev_session.phase() == SignPhase::kPhase1,
+         "dev mode sign session should allow missing strict proofs and stay runnable");
 }
 
 void TestSessionIdAndRecipientMismatchRejected() {

@@ -39,7 +39,8 @@ std::vector<PartyIndex> BuildParticipants(uint32_t n) {
 
 std::vector<std::unique_ptr<KeygenSession>> BuildSessions(uint32_t n,
                                                           uint32_t t,
-                                                          const Bytes& session_id) {
+                                                          const Bytes& session_id,
+                                                          bool strict_mode = true) {
   std::vector<std::unique_ptr<KeygenSession>> sessions;
   sessions.reserve(n);
   const std::vector<PartyIndex> participants = BuildParticipants(n);
@@ -50,10 +51,33 @@ std::vector<std::unique_ptr<KeygenSession>> BuildSessions(uint32_t n,
     cfg.self_id = self_id;
     cfg.participants = participants;
     cfg.threshold = t;
+    cfg.strict_mode = strict_mode;
     cfg.timeout = std::chrono::seconds(10);
     sessions.push_back(std::make_unique<KeygenSession>(std::move(cfg)));
   }
   return sessions;
+}
+
+uint32_t ReadU32Be(const Bytes& input, size_t offset) {
+  if (offset + 4 > input.size()) {
+    throw std::runtime_error("payload is too short to parse u32");
+  }
+  return (static_cast<uint32_t>(input[offset]) << 24) |
+         (static_cast<uint32_t>(input[offset + 1]) << 16) |
+         (static_cast<uint32_t>(input[offset + 2]) << 8) |
+         static_cast<uint32_t>(input[offset + 3]);
+}
+
+Bytes TruncatePhase1PayloadToLegacy(const Bytes& payload) {
+  if (payload.size() < 32 + 4) {
+    throw std::runtime_error("phase1 payload too short to truncate");
+  }
+  const uint32_t n_len = ReadU32Be(payload, 32);
+  const size_t keep_len = 32 + 4 + n_len;
+  if (keep_len > payload.size()) {
+    throw std::runtime_error("phase1 payload malformed while truncating");
+  }
+  return Bytes(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(keep_len));
 }
 
 bool DeliverEnvelope(const Envelope& envelope,
@@ -151,6 +175,8 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
   Expect(baseline.all_X_i.size() == n, "Baseline keygen result must contain all X_i values");
   Expect(baseline.all_paillier_public.size() == n,
          "Baseline keygen result must contain all Paillier public keys");
+  Expect(baseline.all_aux_rsa_params.size() == n,
+         "Baseline keygen result must contain all auxiliary RSA parameters");
   Expect(baseline.local_paillier != nullptr,
          "Baseline keygen result must expose local Paillier provider");
 
@@ -167,6 +193,8 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
            "All sessions must agree on the number of public shares");
     Expect(current.all_paillier_public.size() == baseline.all_paillier_public.size(),
            "All sessions must agree on the number of Paillier public keys");
+    Expect(current.all_aux_rsa_params.size() == baseline.all_aux_rsa_params.size(),
+           "All sessions must agree on auxiliary RSA parameter count");
     Expect(current.local_paillier != nullptr,
            "Each session result must expose local Paillier provider");
 
@@ -192,6 +220,33 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
              "Session result has mismatched Paillier modulus for party " + std::to_string(party_id));
       Expect(it->second.n > min_paillier_n,
              "Session result has Paillier modulus that does not satisfy N > q^8");
+    }
+
+    for (const auto& [party_id, expected_aux] : baseline.all_aux_rsa_params) {
+      const auto aux_it = current.all_aux_rsa_params.find(party_id);
+      Expect(aux_it != current.all_aux_rsa_params.end(),
+             "Session result is missing auxiliary RSA parameters for party " +
+                 std::to_string(party_id));
+      Expect(aux_it->second.n_tilde == expected_aux.n_tilde,
+             "Session result has mismatched aux Ntilde for party " + std::to_string(party_id));
+      Expect(aux_it->second.h1 == expected_aux.h1,
+             "Session result has mismatched aux h1 for party " + std::to_string(party_id));
+      Expect(aux_it->second.h2 == expected_aux.h2,
+             "Session result has mismatched aux h2 for party " + std::to_string(party_id));
+      if (baseline.strict_mode) {
+        const auto square_it = current.all_square_free_proofs.find(party_id);
+        const auto aux_pf_it = current.all_aux_param_proofs.find(party_id);
+        Expect(square_it != current.all_square_free_proofs.end(),
+               "Strict keygen result must include square-free proof for party " +
+                   std::to_string(party_id));
+        Expect(aux_pf_it != current.all_aux_param_proofs.end(),
+               "Strict keygen result must include aux param proof for party " +
+                   std::to_string(party_id));
+        Expect(tecdsa::VerifySquareFreeProof(current.all_paillier_public.at(party_id).n, square_it->second),
+               "Strict keygen result must include a valid square-free proof");
+        Expect(tecdsa::VerifyAuxRsaParamProof(aux_it->second, aux_pf_it->second),
+               "Strict keygen result must include a valid aux param proof");
+      }
     }
 
     const auto self_paillier_it = current.all_paillier_public.find(self_id);
@@ -324,6 +379,58 @@ void TestTamperedPhase3SchnorrAbortsPeers() {
          "Peer 3 must abort when Schnorr proof is tampered");
 }
 
+void TestStrictModeMissingPhase1ProofAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC2, 0x03, 0x01}, /*strict_mode=*/true);
+
+  std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase1) {
+    if (envelope.from == 1) {
+      envelope.payload = TruncatePhase1PayloadToLegacy(envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase1 payload to drop strict proofs");
+
+  for (const Envelope& envelope : phase1) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort when phase1 strict proofs are missing");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort when phase1 strict proofs are missing");
+}
+
+void TestDevModeAcceptsLegacyPhase1WithoutProofs() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC3, 0x03, 0x01}, /*strict_mode=*/false);
+
+  std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase1) {
+    if (envelope.from == 1) {
+      envelope.payload = TruncatePhase1PayloadToLegacy(envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase1 payload to downgrade");
+  DeliverEnvelopesOrThrow(phase1, &sessions);
+  EnsureAllSessionsInPhase(sessions, KeygenPhase::kPhase2);
+
+  const std::vector<Envelope> phase2 = BuildAndCollectPhase2(&sessions);
+  DeliverEnvelopesOrThrow(phase2, &sessions);
+  EnsureAllSessionsInPhase(sessions, KeygenPhase::kPhase3);
+
+  const std::vector<Envelope> phase3 = BuildAndCollectPhase3(&sessions);
+  DeliverEnvelopesOrThrow(phase3, &sessions);
+  EnsureAllSessionsCompleted(sessions);
+  for (const auto& session : sessions) {
+    Expect(!session->result().strict_mode, "Dev-mode keygen result should carry strict_mode=false");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -333,6 +440,8 @@ int main() {
     TestTamperedPhase1PaillierModulusAbortsReceiver();
     TestTamperedPhase2ShareAbortsReceiver();
     TestTamperedPhase3SchnorrAbortsPeers();
+    TestStrictModeMissingPhase1ProofAbortsReceiver();
+    TestDevModeAcceptsLegacyPhase1WithoutProofs();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';
     return 1;

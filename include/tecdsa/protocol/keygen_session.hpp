@@ -10,6 +10,7 @@
 #include "tecdsa/crypto/ec_point.hpp"
 #include "tecdsa/crypto/paillier.hpp"
 #include "tecdsa/crypto/scalar.hpp"
+#include "tecdsa/crypto/strict_proofs.hpp"
 #include "tecdsa/net/envelope.hpp"
 #include "tecdsa/protocol/session.hpp"
 
@@ -36,6 +37,7 @@ struct KeygenSessionConfig {
   std::vector<PartyIndex> participants;
   uint32_t threshold = 1;
   uint32_t paillier_modulus_bits = 2048;
+  bool strict_mode = true;
   std::chrono::milliseconds timeout = std::chrono::seconds(30);
 };
 
@@ -51,6 +53,10 @@ struct KeygenResult {
   std::unordered_map<PartyIndex, ECPoint> all_X_i;
   std::shared_ptr<PaillierProvider> local_paillier;
   std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public;
+  std::unordered_map<PartyIndex, AuxRsaParams> all_aux_rsa_params;
+  std::unordered_map<PartyIndex, SquareFreeProof> all_square_free_proofs;
+  std::unordered_map<PartyIndex, AuxRsaParamProof> all_aux_param_proofs;
+  bool strict_mode = true;
 };
 
 class KeygenSession : public Session {
@@ -93,6 +99,7 @@ class KeygenSession : public Session {
 
   bool VerifyDealerShareForSelf(PartyIndex dealer, const Scalar& share) const;
   void EnsureLocalPaillierPrepared();
+  void EnsureLocalStrictProofArtifactsPrepared();
   void MaybeAdvanceAfterPhase1();
   void MaybeAdvanceAfterPhase2();
   void MaybeAdvanceAfterPhase3();
@@ -105,6 +112,7 @@ class KeygenSession : public Session {
   std::vector<PartyIndex> participants_;
   uint32_t threshold_ = 1;
   uint32_t paillier_modulus_bits_ = 2048;
+  bool strict_mode_ = true;
   std::unordered_set<PartyIndex> peers_;
 
   std::unordered_set<PartyIndex> seen_phase1_;
@@ -119,6 +127,9 @@ class KeygenSession : public Session {
   std::unordered_map<PartyIndex, Scalar> local_shares_;
   std::shared_ptr<PaillierProvider> local_paillier_;
   PaillierPublicKey local_paillier_public_;
+  AuxRsaParams local_aux_rsa_params_;
+  SquareFreeProof local_square_free_proof_;
+  AuxRsaParamProof local_aux_param_proof_;
   ECPoint local_y_i_;
   Bytes local_commitment_;
   Bytes local_open_randomness_;
