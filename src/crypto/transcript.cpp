@@ -25,7 +25,7 @@ std::array<uint8_t, SHA256_DIGEST_LENGTH> Sha256(std::span<const uint8_t> input)
 
 }  // namespace
 
-void Transcript::append(const std::string& label, std::span<const uint8_t> data) {
+void Transcript::append(std::string_view label, std::span<const uint8_t> data) {
   if (label.size() > UINT32_MAX || data.size() > UINT32_MAX) {
     throw std::invalid_argument("Transcript field exceeds uint32 length");
   }
@@ -35,6 +35,22 @@ void Transcript::append(const std::string& label, std::span<const uint8_t> data)
 
   AppendU32Be(static_cast<uint32_t>(data.size()), &transcript_);
   transcript_.insert(transcript_.end(), data.begin(), data.end());
+}
+
+void Transcript::append_u32_be(std::string_view label, uint32_t value) {
+  std::array<uint8_t, 4> encoded = {
+      static_cast<uint8_t>((value >> 24) & 0xFF),
+      static_cast<uint8_t>((value >> 16) & 0xFF),
+      static_cast<uint8_t>((value >> 8) & 0xFF),
+      static_cast<uint8_t>(value & 0xFF),
+  };
+  append(label, encoded);
+}
+
+void Transcript::append_fields(std::initializer_list<TranscriptFieldRef> fields) {
+  for (const TranscriptFieldRef& field : fields) {
+    append(field.label, field.data);
+  }
 }
 
 Scalar Transcript::challenge_scalar_mod_q() const {

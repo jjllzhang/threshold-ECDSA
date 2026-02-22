@@ -144,13 +144,6 @@ uint32_t ReadU32Be(std::span<const uint8_t> input, size_t* offset) {
          static_cast<uint32_t>(input[i + 3]);
 }
 
-Bytes PartyIdToBytes(PartyIndex id) {
-  Bytes out;
-  out.reserve(4);
-  AppendU32Be(id, &out);
-  return out;
-}
-
 void AppendSizedField(std::span<const uint8_t> field, Bytes* out) {
   if (field.size() > UINT32_MAX) {
     throw std::invalid_argument("sized field exceeds uint32 length");
@@ -412,13 +405,17 @@ void AppendCommonMtaTranscriptFields(Transcript* transcript,
                                      const MtaProofContext& ctx) {
   const std::span<const uint8_t> proof_id_view(
       reinterpret_cast<const uint8_t*>(proof_id), std::strlen(proof_id));
-  transcript->append("proof_id", proof_id_view);
-  transcript->append("session_id", ctx.session_id);
-  transcript->append("initiator", PartyIdToBytes(ctx.initiator_id));
-  transcript->append("responder", PartyIdToBytes(ctx.responder_id));
-  transcript->append("mta_id", ctx.mta_instance_id);
-  transcript->append("curve", CurveNameBytes());
-  transcript->append("q", ModulusQBytes());
+  transcript->append_fields({
+      TranscriptFieldRef{.label = "proof_id", .data = proof_id_view},
+      TranscriptFieldRef{.label = "session_id", .data = ctx.session_id},
+  });
+  transcript->append_u32_be("initiator", ctx.initiator_id);
+  transcript->append_u32_be("responder", ctx.responder_id);
+  transcript->append_fields({
+      TranscriptFieldRef{.label = "mta_id", .data = ctx.mta_instance_id},
+      TranscriptFieldRef{.label = "curve", .data = CurveNameBytes()},
+      TranscriptFieldRef{.label = "q", .data = ModulusQBytes()},
+  });
 }
 
 Scalar BuildA1RangeChallenge(const MtaProofContext& ctx,
@@ -431,15 +428,26 @@ Scalar BuildA1RangeChallenge(const MtaProofContext& ctx,
                              const mpz_class& w) {
   Transcript transcript;
   AppendCommonMtaTranscriptFields(&transcript, kA1RangeProofId, ctx);
-  transcript.append("N", EncodeMpz(n));
-  transcript.append("Gamma", EncodeMpz(gamma));
-  transcript.append("Ntilde", EncodeMpz(aux.n_tilde));
-  transcript.append("h1", EncodeMpz(aux.h1));
-  transcript.append("h2", EncodeMpz(aux.h2));
-  transcript.append("c", EncodeMpz(c));
-  transcript.append("z", EncodeMpz(z));
-  transcript.append("u", EncodeMpz(u));
-  transcript.append("w", EncodeMpz(w));
+  const Bytes n_bytes = EncodeMpz(n);
+  const Bytes gamma_bytes = EncodeMpz(gamma);
+  const Bytes n_tilde_bytes = EncodeMpz(aux.n_tilde);
+  const Bytes h1_bytes = EncodeMpz(aux.h1);
+  const Bytes h2_bytes = EncodeMpz(aux.h2);
+  const Bytes c_bytes = EncodeMpz(c);
+  const Bytes z_bytes = EncodeMpz(z);
+  const Bytes u_bytes = EncodeMpz(u);
+  const Bytes w_bytes = EncodeMpz(w);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "N", .data = n_bytes},
+      TranscriptFieldRef{.label = "Gamma", .data = gamma_bytes},
+      TranscriptFieldRef{.label = "Ntilde", .data = n_tilde_bytes},
+      TranscriptFieldRef{.label = "h1", .data = h1_bytes},
+      TranscriptFieldRef{.label = "h2", .data = h2_bytes},
+      TranscriptFieldRef{.label = "c", .data = c_bytes},
+      TranscriptFieldRef{.label = "z", .data = z_bytes},
+      TranscriptFieldRef{.label = "u", .data = u_bytes},
+      TranscriptFieldRef{.label = "w", .data = w_bytes},
+  });
   return transcript.challenge_scalar_mod_q();
 }
 
@@ -453,20 +461,36 @@ Scalar BuildA2MtAwcChallenge(const MtaProofContext& ctx,
                              const A2MtAwcProof& proof) {
   Transcript transcript;
   AppendCommonMtaTranscriptFields(&transcript, kA2MtAwcProofId, ctx);
-  transcript.append("N", EncodeMpz(n));
-  transcript.append("Gamma", EncodeMpz(gamma));
-  transcript.append("Ntilde", EncodeMpz(aux.n_tilde));
-  transcript.append("h1", EncodeMpz(aux.h1));
-  transcript.append("h2", EncodeMpz(aux.h2));
-  transcript.append("c1", EncodeMpz(c1));
-  transcript.append("c2", EncodeMpz(c2));
-  transcript.append("X", EncodePoint(statement_x));
-  transcript.append("u", EncodePoint(proof.u));
-  transcript.append("z", EncodeMpz(proof.z));
-  transcript.append("z2", EncodeMpz(proof.z2));
-  transcript.append("t", EncodeMpz(proof.t));
-  transcript.append("v", EncodeMpz(proof.v));
-  transcript.append("w", EncodeMpz(proof.w));
+  const Bytes n_bytes = EncodeMpz(n);
+  const Bytes gamma_bytes = EncodeMpz(gamma);
+  const Bytes n_tilde_bytes = EncodeMpz(aux.n_tilde);
+  const Bytes h1_bytes = EncodeMpz(aux.h1);
+  const Bytes h2_bytes = EncodeMpz(aux.h2);
+  const Bytes c1_bytes = EncodeMpz(c1);
+  const Bytes c2_bytes = EncodeMpz(c2);
+  const Bytes x_bytes = EncodePoint(statement_x);
+  const Bytes u_bytes = EncodePoint(proof.u);
+  const Bytes z_bytes = EncodeMpz(proof.z);
+  const Bytes z2_bytes = EncodeMpz(proof.z2);
+  const Bytes t_bytes = EncodeMpz(proof.t);
+  const Bytes v_bytes = EncodeMpz(proof.v);
+  const Bytes w_bytes = EncodeMpz(proof.w);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "N", .data = n_bytes},
+      TranscriptFieldRef{.label = "Gamma", .data = gamma_bytes},
+      TranscriptFieldRef{.label = "Ntilde", .data = n_tilde_bytes},
+      TranscriptFieldRef{.label = "h1", .data = h1_bytes},
+      TranscriptFieldRef{.label = "h2", .data = h2_bytes},
+      TranscriptFieldRef{.label = "c1", .data = c1_bytes},
+      TranscriptFieldRef{.label = "c2", .data = c2_bytes},
+      TranscriptFieldRef{.label = "X", .data = x_bytes},
+      TranscriptFieldRef{.label = "u", .data = u_bytes},
+      TranscriptFieldRef{.label = "z", .data = z_bytes},
+      TranscriptFieldRef{.label = "z2", .data = z2_bytes},
+      TranscriptFieldRef{.label = "t", .data = t_bytes},
+      TranscriptFieldRef{.label = "v", .data = v_bytes},
+      TranscriptFieldRef{.label = "w", .data = w_bytes},
+  });
   return transcript.challenge_scalar_mod_q();
 }
 
@@ -479,18 +503,32 @@ Scalar BuildA3MtAChallenge(const MtaProofContext& ctx,
                            const A3MtAProof& proof) {
   Transcript transcript;
   AppendCommonMtaTranscriptFields(&transcript, kA3MtAProofId, ctx);
-  transcript.append("N", EncodeMpz(n));
-  transcript.append("Gamma", EncodeMpz(gamma));
-  transcript.append("Ntilde", EncodeMpz(aux.n_tilde));
-  transcript.append("h1", EncodeMpz(aux.h1));
-  transcript.append("h2", EncodeMpz(aux.h2));
-  transcript.append("c1", EncodeMpz(c1));
-  transcript.append("c2", EncodeMpz(c2));
-  transcript.append("z", EncodeMpz(proof.z));
-  transcript.append("z2", EncodeMpz(proof.z2));
-  transcript.append("t", EncodeMpz(proof.t));
-  transcript.append("v", EncodeMpz(proof.v));
-  transcript.append("w", EncodeMpz(proof.w));
+  const Bytes n_bytes = EncodeMpz(n);
+  const Bytes gamma_bytes = EncodeMpz(gamma);
+  const Bytes n_tilde_bytes = EncodeMpz(aux.n_tilde);
+  const Bytes h1_bytes = EncodeMpz(aux.h1);
+  const Bytes h2_bytes = EncodeMpz(aux.h2);
+  const Bytes c1_bytes = EncodeMpz(c1);
+  const Bytes c2_bytes = EncodeMpz(c2);
+  const Bytes z_bytes = EncodeMpz(proof.z);
+  const Bytes z2_bytes = EncodeMpz(proof.z2);
+  const Bytes t_bytes = EncodeMpz(proof.t);
+  const Bytes v_bytes = EncodeMpz(proof.v);
+  const Bytes w_bytes = EncodeMpz(proof.w);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "N", .data = n_bytes},
+      TranscriptFieldRef{.label = "Gamma", .data = gamma_bytes},
+      TranscriptFieldRef{.label = "Ntilde", .data = n_tilde_bytes},
+      TranscriptFieldRef{.label = "h1", .data = h1_bytes},
+      TranscriptFieldRef{.label = "h2", .data = h2_bytes},
+      TranscriptFieldRef{.label = "c1", .data = c1_bytes},
+      TranscriptFieldRef{.label = "c2", .data = c2_bytes},
+      TranscriptFieldRef{.label = "z", .data = z_bytes},
+      TranscriptFieldRef{.label = "z2", .data = z2_bytes},
+      TranscriptFieldRef{.label = "t", .data = t_bytes},
+      TranscriptFieldRef{.label = "v", .data = v_bytes},
+      TranscriptFieldRef{.label = "w", .data = w_bytes},
+  });
   return transcript.challenge_scalar_mod_q();
 }
 
@@ -1099,14 +1137,17 @@ Scalar BuildSchnorrChallenge(const Bytes& session_id,
   Transcript transcript;
   const std::span<const uint8_t> proof_id(
       reinterpret_cast<const uint8_t*>(kSchnorrProofId), std::strlen(kSchnorrProofId));
-  transcript.append("proof_id", proof_id);
-  transcript.append("session_id", session_id);
-  const Bytes party_bytes = PartyIdToBytes(party_id);
-  transcript.append("party_id", party_bytes);
   const Bytes statement_bytes = EncodePoint(statement);
-  transcript.append("X", statement_bytes);
   const Bytes a_bytes = EncodePoint(a);
-  transcript.append("A", a_bytes);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "proof_id", .data = proof_id},
+      TranscriptFieldRef{.label = "session_id", .data = session_id},
+  });
+  transcript.append_u32_be("party_id", party_id);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "X", .data = statement_bytes},
+      TranscriptFieldRef{.label = "A", .data = a_bytes},
+  });
   return transcript.challenge_scalar_mod_q();
 }
 
@@ -1118,16 +1159,19 @@ Scalar BuildVRelationChallenge(const Bytes& session_id,
   Transcript transcript;
   const std::span<const uint8_t> proof_id(
       reinterpret_cast<const uint8_t*>(kVRelationProofId), std::strlen(kVRelationProofId));
-  transcript.append("proof_id", proof_id);
-  transcript.append("session_id", session_id);
-  const Bytes party_bytes = PartyIdToBytes(party_id);
-  transcript.append("party_id", party_bytes);
   const Bytes r_bytes = EncodePoint(r_statement);
-  transcript.append("R", r_bytes);
   const Bytes v_bytes = EncodePoint(v_statement);
-  transcript.append("V", v_bytes);
   const Bytes alpha_bytes = EncodePoint(alpha);
-  transcript.append("alpha", alpha_bytes);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "proof_id", .data = proof_id},
+      TranscriptFieldRef{.label = "session_id", .data = session_id},
+  });
+  transcript.append_u32_be("party_id", party_id);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "R", .data = r_bytes},
+      TranscriptFieldRef{.label = "V", .data = v_bytes},
+      TranscriptFieldRef{.label = "alpha", .data = alpha_bytes},
+  });
   return transcript.challenge_scalar_mod_q();
 }
 

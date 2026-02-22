@@ -157,13 +157,6 @@ mpz_class ReadMpzField(std::span<const uint8_t> input,
   return DecodeMpz(encoded, max_len);
 }
 
-Bytes PartyIdToBytes(PartyIndex id) {
-  Bytes out;
-  out.reserve(4);
-  AppendU32Be(id, &out);
-  return out;
-}
-
 Scalar RandomNonZeroScalar() {
   while (true) {
     const Scalar candidate = Csprng::RandomScalar();
@@ -197,17 +190,19 @@ Scalar BuildSchnorrChallenge(const Bytes& session_id,
                              const ECPoint& statement,
                              const ECPoint& a) {
   Transcript transcript;
-
   const std::span<const uint8_t> proof_id(
       reinterpret_cast<const uint8_t*>(kSchnorrProofId), std::strlen(kSchnorrProofId));
-  transcript.append("proof_id", proof_id);
-  transcript.append("session_id", session_id);
-  const Bytes party_bytes = PartyIdToBytes(party_id);
-  transcript.append("party_id", party_bytes);
   const Bytes statement_bytes = EncodePoint(statement);
-  transcript.append("X", statement_bytes);
   const Bytes a_bytes = EncodePoint(a);
-  transcript.append("A", a_bytes);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "proof_id", .data = proof_id},
+      TranscriptFieldRef{.label = "session_id", .data = session_id},
+  });
+  transcript.append_u32_be("party_id", party_id);
+  transcript.append_fields({
+      TranscriptFieldRef{.label = "X", .data = statement_bytes},
+      TranscriptFieldRef{.label = "A", .data = a_bytes},
+  });
 
   return transcript.challenge_scalar_mod_q();
 }

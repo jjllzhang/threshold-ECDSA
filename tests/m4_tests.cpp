@@ -185,12 +185,12 @@ SignFixture BuildSignFixture(const std::vector<PartyIndex>& signers) {
   return fixture;
 }
 
-std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
+std::vector<SignSessionConfig> BuildSignSessionConfigs(
     const SignFixture& fixture,
     const std::unordered_map<PartyIndex, KeygenResult>& keygen_results,
     const Bytes& sign_session_id) {
-  std::vector<std::unique_ptr<SignSession>> sessions;
-  sessions.reserve(fixture.signers.size());
+  std::vector<SignSessionConfig> configs;
+  configs.reserve(fixture.signers.size());
 
   const auto baseline_it = keygen_results.find(fixture.signers.front());
   if (baseline_it == keygen_results.end()) {
@@ -276,9 +276,24 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     cfg.fixed_k_i = fixture.fixed_k.at(self_id);
     cfg.fixed_gamma_i = fixture.fixed_gamma.at(self_id);
 
-    sessions.push_back(std::make_unique<SignSession>(std::move(cfg)));
+    configs.push_back(std::move(cfg));
   }
 
+  return configs;
+}
+
+std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
+    const SignFixture& fixture,
+    const std::unordered_map<PartyIndex, KeygenResult>& keygen_results,
+    const Bytes& sign_session_id) {
+  std::vector<SignSessionConfig> configs =
+      BuildSignSessionConfigs(fixture, keygen_results, sign_session_id);
+
+  std::vector<std::unique_ptr<SignSession>> sessions;
+  sessions.reserve(configs.size());
+  for (SignSessionConfig& cfg : configs) {
+    sessions.push_back(std::make_unique<SignSession>(std::move(cfg)));
+  }
   return sessions;
 }
 
@@ -523,6 +538,121 @@ bool ReplacePhase5BVPoint(Envelope* envelope, std::span<const uint8_t> replaceme
   }
   std::copy(replacement_point.begin(), replacement_point.end(), envelope->payload.begin());
   return true;
+}
+
+void TestStage4SignConstructorRejectsSmallPaillierModulus() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD0, 0x03, 0x02});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  std::vector<SignSessionConfig> configs =
+      BuildSignSessionConfigs(fixture, keygen_results, Bytes{0xE0, 0x02, 0x02});
+
+  const size_t cfg_idx = FindPartyIndexOrThrow(signers, 1);
+  SignSessionConfig bad_cfg = std::move(configs[cfg_idx]);
+  bad_cfg.all_paillier_public.at(2).n = mpz_class(17);
+
+  ExpectThrow([&]() { (void)SignSession(std::move(bad_cfg)); },
+              "SignSession must reject participant Paillier modulus N <= q^8");
+}
+
+void TestStage4Phase2InitUsesResponderOwnedAuxParams() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD0, 0x03, 0x03});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  std::vector<SignSessionConfig> configs =
+      BuildSignSessionConfigs(fixture, keygen_results, Bytes{0xE0, 0x02, 0x03});
+
+  const size_t responder_cfg_idx = FindPartyIndexOrThrow(signers, 2);
+  SignSessionConfig& responder_cfg = configs[responder_cfg_idx];
+  const auto initiator_aux_it = responder_cfg.all_aux_rsa_params.find(1);
+  Expect(initiator_aux_it != responder_cfg.all_aux_rsa_params.end(),
+         "Responder config must include initiator aux params");
+  responder_cfg.all_aux_rsa_params[2] = initiator_aux_it->second;
+  responder_cfg.all_aux_param_proofs[2] =
+      tecdsa::BuildAuxRsaParamProof(initiator_aux_it->second);
+
+  std::vector<std::unique_ptr<SignSession>> sessions;
+  sessions.reserve(configs.size());
+  for (SignSessionConfig& cfg : configs) {
+    sessions.push_back(std::make_unique<SignSession>(std::move(cfg)));
+  }
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  const std::vector<Envelope> phase2_init = CollectPhase2Messages(&sessions);
+  for (const Envelope& envelope : phase2_init) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t responder_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[responder_idx]->status() == SessionStatus::kAborted,
+         "Responder must abort when A1 verification uses responder-owned aux params");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Stage4 A1 ownership failure must not expose signature result");
+  }
+}
+
+void TestStage4Phase2ResponseUsesInitiatorOwnedAuxParams() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD0, 0x03, 0x04});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  std::vector<SignSessionConfig> configs =
+      BuildSignSessionConfigs(fixture, keygen_results, Bytes{0xE0, 0x02, 0x04});
+
+  const size_t responder_cfg_idx = FindPartyIndexOrThrow(signers, 2);
+  SignSessionConfig& responder_cfg = configs[responder_cfg_idx];
+  const auto self_aux_it = responder_cfg.all_aux_rsa_params.find(2);
+  Expect(self_aux_it != responder_cfg.all_aux_rsa_params.end(),
+         "Responder config must include self aux params");
+  responder_cfg.all_aux_rsa_params[1] = self_aux_it->second;
+  responder_cfg.all_aux_param_proofs[1] =
+      tecdsa::BuildAuxRsaParamProof(self_aux_it->second);
+
+  std::vector<std::unique_ptr<SignSession>> sessions;
+  sessions.reserve(configs.size());
+  for (SignSessionConfig& cfg : configs) {
+    sessions.push_back(std::make_unique<SignSession>(std::move(cfg)));
+  }
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  const size_t initiator_idx = FindPartyIndexOrThrow(signers, 1);
+  const size_t responder_idx = FindPartyIndexOrThrow(signers, 2);
+
+  std::vector<Envelope> initiator_msgs = sessions[initiator_idx]->BuildPhase2MtaEnvelopes();
+  size_t delivered_init_count = 0;
+  for (const Envelope& envelope : initiator_msgs) {
+    if (envelope.type == SignSession::MessageTypeForPhase(SignPhase::kPhase2) &&
+        envelope.from == 1 &&
+        envelope.to == 2) {
+      (void)DeliverSignEnvelope(envelope, signers, &sessions);
+      ++delivered_init_count;
+    }
+  }
+  Expect(delivered_init_count > 0, "Test setup failed to deliver any phase2 init envelope");
+
+  std::vector<Envelope> responder_msgs = sessions[responder_idx]->BuildPhase2MtaEnvelopes();
+  std::vector<Envelope> responder_responses;
+  for (const Envelope& envelope : responder_msgs) {
+    if (envelope.type == SignSession::Phase2ResponseMessageType() &&
+        envelope.from == 2 &&
+        envelope.to == 1) {
+      responder_responses.push_back(envelope);
+    }
+  }
+  Expect(!responder_responses.empty(),
+         "Phase2 must emit responder responses for A2/A3 ownership checks");
+  for (const Envelope& envelope : responder_responses) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  Expect(sessions[initiator_idx]->status() == SessionStatus::kAborted,
+         "Initiator must abort when A2/A3 verification uses initiator-owned aux params");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Stage4 A2/A3 ownership failure must not expose signature result");
+  }
 }
 
 void TestM4SignEndToEndProducesVerifiableSignature() {
@@ -1076,6 +1206,9 @@ void TestM9TamperedPhase5BVPointAbortsReceiver() {
 
 int main() {
   try {
+    TestStage4SignConstructorRejectsSmallPaillierModulus();
+    TestStage4Phase2InitUsesResponderOwnedAuxParams();
+    TestStage4Phase2ResponseUsesInitiatorOwnedAuxParams();
     TestM4SignEndToEndProducesVerifiableSignature();
     TestM4Phase5DFailurePreventsPhase5EReveal();
     TestM5Phase2InstanceIdMismatchAborts();
