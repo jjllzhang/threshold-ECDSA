@@ -555,6 +555,121 @@ void TestStage4SignConstructorRejectsSmallPaillierModulus() {
               "SignSession must reject participant Paillier modulus N <= q^8");
 }
 
+void TestStage6SignConstructorRejectsMissingKeygenProofArtifacts() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xDE, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  std::vector<SignSessionConfig> configs =
+      BuildSignSessionConfigs(fixture, keygen_results, Bytes{0xEE, 0x02, 0x01});
+
+  const size_t cfg_idx = FindPartyIndexOrThrow(signers, 1);
+  SignSessionConfig missing_cfg = configs[cfg_idx];
+  missing_cfg.all_square_free_proofs.clear();
+  missing_cfg.all_aux_param_proofs.clear();
+
+  ExpectThrow([&]() { (void)SignSession(std::move(missing_cfg)); },
+              "strict SignSession must reject missing keygen proof artifacts");
+}
+
+void TestStage6SignConstructorRejectsInvalidKeygenProofArtifacts() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xDF, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  std::vector<SignSessionConfig> configs =
+      BuildSignSessionConfigs(fixture, keygen_results, Bytes{0xEF, 0x02, 0x01});
+
+  const size_t cfg_idx = FindPartyIndexOrThrow(signers, 1);
+
+  SignSessionConfig bad_square_cfg = configs[cfg_idx];
+  auto square_it = bad_square_cfg.all_square_free_proofs.find(2);
+  if (square_it == bad_square_cfg.all_square_free_proofs.end() || square_it->second.blob.empty()) {
+    throw std::runtime_error("test setup missing square-free proof blob to tamper");
+  }
+  square_it->second.blob.back() ^= 0x01;
+  ExpectThrow([&]() { (void)SignSession(std::move(bad_square_cfg)); },
+              "strict SignSession must reject invalid square-free keygen proof");
+
+  SignSessionConfig bad_aux_cfg = configs[cfg_idx];
+  auto aux_it = bad_aux_cfg.all_aux_param_proofs.find(2);
+  if (aux_it == bad_aux_cfg.all_aux_param_proofs.end() || aux_it->second.blob.empty()) {
+    throw std::runtime_error("test setup missing aux proof blob to tamper");
+  }
+  aux_it->second.blob.back() ^= 0x01;
+  ExpectThrow([&]() { (void)SignSession(std::move(bad_aux_cfg)); },
+              "strict SignSession must reject invalid aux keygen proof");
+}
+
+void TestStage6MalformedPhase2InitProofPayloadAbortsResponder() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xE0, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xF0, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  std::vector<Envelope> phase2_init = CollectPhase2Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase2_init) {
+    if (envelope.type == SignSession::MessageTypeForPhase(SignPhase::kPhase2) &&
+        envelope.from == 1 &&
+        envelope.to == 2 &&
+        envelope.payload.size() > 1) {
+      envelope.payload.resize(envelope.payload.size() - 1);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase2 init payload to truncate");
+
+  for (const Envelope& envelope : phase2_init) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t responder_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[responder_idx]->status() == SessionStatus::kAborted,
+         "Responder must abort on malformed phase2 init proof payload");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Malformed phase2 init payload must not expose signature result");
+  }
+}
+
+void TestStage6MalformedPhase2ResponseProofPayloadAbortsInitiator() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xE1, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xF1, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+  DeliverSignEnvelopesOrThrow(CollectPhase2Messages(&sessions), signers, &sessions);
+
+  std::vector<Envelope> phase2_responses = CollectPhase2Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase2_responses) {
+    if (envelope.type == SignSession::Phase2ResponseMessageType() &&
+        envelope.from == 2 &&
+        envelope.to == 1 &&
+        envelope.payload.size() > 1) {
+      envelope.payload.resize(envelope.payload.size() - 1);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase2 response payload to truncate");
+
+  for (const Envelope& envelope : phase2_responses) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t initiator_idx = FindPartyIndexOrThrow(signers, 1);
+  Expect(sessions[initiator_idx]->status() == SessionStatus::kAborted,
+         "Initiator must abort on malformed phase2 response proof payload");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Malformed phase2 response payload must not expose signature result");
+  }
+}
+
 void TestStage4Phase2InitUsesResponderOwnedAuxParams() {
   const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD0, 0x03, 0x03});
   const std::vector<PartyIndex> signers = {1, 2};
@@ -1207,6 +1322,10 @@ void TestM9TamperedPhase5BVPointAbortsReceiver() {
 int main() {
   try {
     TestStage4SignConstructorRejectsSmallPaillierModulus();
+    TestStage6SignConstructorRejectsMissingKeygenProofArtifacts();
+    TestStage6SignConstructorRejectsInvalidKeygenProofArtifacts();
+    TestStage6MalformedPhase2InitProofPayloadAbortsResponder();
+    TestStage6MalformedPhase2ResponseProofPayloadAbortsInitiator();
     TestStage4Phase2InitUsesResponderOwnedAuxParams();
     TestStage4Phase2ResponseUsesInitiatorOwnedAuxParams();
     TestM4SignEndToEndProducesVerifiableSignature();

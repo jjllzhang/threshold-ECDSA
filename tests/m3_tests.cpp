@@ -140,6 +140,64 @@ Bytes RewritePhase1AuxProofAsLegacyBlob(const Bytes& payload) {
   return out;
 }
 
+void TamperPhase1AuxProof(Bytes* payload) {
+  if (payload == nullptr || payload->size() < 32 + 4) {
+    throw std::runtime_error("phase1 payload too short to tamper aux proof");
+  }
+
+  size_t offset = 32;
+  offset = SkipSizedField(*payload, offset, "Paillier N");
+  offset = SkipSizedField(*payload, offset, "aux Ntilde");
+  offset = SkipSizedField(*payload, offset, "aux h1");
+  offset = SkipSizedField(*payload, offset, "aux h2");
+  if (offset + 4 > payload->size()) {
+    throw std::runtime_error("phase1 payload missing aux proof length");
+  }
+  const uint32_t proof_len = ReadU32Be(*payload, offset);
+  offset += 4;
+  if (proof_len == 0 || offset + proof_len != payload->size()) {
+    throw std::runtime_error("phase1 payload has malformed aux proof field");
+  }
+  (*payload)[offset + proof_len - 1] ^= 0x01;
+}
+
+void CorruptPhase1AuxH1(Bytes* payload) {
+  if (payload == nullptr || payload->size() < 32 + 4) {
+    throw std::runtime_error("phase1 payload too short to tamper aux h1");
+  }
+
+  size_t offset = 32;
+  offset = SkipSizedField(*payload, offset, "Paillier N");
+  offset = SkipSizedField(*payload, offset, "aux Ntilde");
+  if (offset + 4 > payload->size()) {
+    throw std::runtime_error("phase1 payload missing aux h1 length");
+  }
+  const uint32_t h1_len = ReadU32Be(*payload, offset);
+  offset += 4;
+  if (h1_len == 0 || offset + h1_len > payload->size()) {
+    throw std::runtime_error("phase1 payload has malformed aux h1 field");
+  }
+
+  std::fill(payload->begin() + static_cast<std::ptrdiff_t>(offset),
+            payload->begin() + static_cast<std::ptrdiff_t>(offset + h1_len),
+            static_cast<uint8_t>(0x00));
+}
+
+void TamperPhase3SquareFreeProof(Bytes* payload) {
+  constexpr size_t kPhase3BaseLen = 33 + 33 + 32;
+  if (payload == nullptr || payload->size() < kPhase3BaseLen + 4) {
+    throw std::runtime_error("phase3 payload too short to tamper square-free proof");
+  }
+
+  size_t offset = kPhase3BaseLen;
+  const uint32_t proof_len = ReadU32Be(*payload, offset);
+  offset += 4;
+  if (proof_len == 0 || offset + proof_len != payload->size()) {
+    throw std::runtime_error("phase3 payload has malformed square-free proof field");
+  }
+  (*payload)[offset + proof_len - 1] ^= 0x01;
+}
+
 bool DeliverEnvelope(const Envelope& envelope,
                      std::vector<std::unique_ptr<KeygenSession>>* sessions) {
   bool ok = true;
@@ -487,6 +545,54 @@ void TestStrictModeLegacyAuxProofEncodingAbortsReceiver() {
          "Strict receiver must abort on legacy aux proof encoding");
 }
 
+void TestStrictModeTamperedPhase1AuxProofAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC7, 0x03, 0x01}, /*strict_mode=*/true);
+
+  std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase1) {
+    if (envelope.from == 1) {
+      TamperPhase1AuxProof(&envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase1 payload to tamper aux proof");
+
+  for (const Envelope& envelope : phase1) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on tampered phase1 aux proof");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on tampered phase1 aux proof");
+}
+
+void TestStrictModeMalformedAuxParamsProofMismatchAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC8, 0x03, 0x01}, /*strict_mode=*/true);
+
+  std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase1) {
+    if (envelope.from == 1) {
+      CorruptPhase1AuxH1(&envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase1 payload to corrupt aux parameters");
+
+  for (const Envelope& envelope : phase1) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on malformed aux parameters");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on malformed aux parameters");
+}
+
 void TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver() {
   auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC4, 0x03, 0x01}, /*strict_mode=*/true);
 
@@ -515,6 +621,36 @@ void TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver() {
          "Strict receiver must abort when phase3 square-free proof is missing");
   Expect(sessions[2]->status() == SessionStatus::kAborted,
          "Strict receiver must abort when phase3 square-free proof is missing");
+}
+
+void TestStrictModeTamperedPhase3SquareFreeProofAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC9, 0x03, 0x01}, /*strict_mode=*/true);
+
+  const std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  DeliverEnvelopesOrThrow(phase1, &sessions);
+  const std::vector<Envelope> phase2 = BuildAndCollectPhase2(&sessions);
+  DeliverEnvelopesOrThrow(phase2, &sessions);
+  EnsureAllSessionsInPhase(sessions, KeygenPhase::kPhase3);
+
+  std::vector<Envelope> phase3 = BuildAndCollectPhase3(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase3) {
+    if (envelope.from == 1) {
+      TamperPhase3SquareFreeProof(&envelope.payload);
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase3 payload to tamper square-free proof");
+
+  for (const Envelope& envelope : phase3) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on tampered phase3 square-free proof");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Strict receiver must abort on tampered phase3 square-free proof");
 }
 
 void TestDevModeAcceptsLegacyPhase1WithoutProofs() {
@@ -556,7 +692,10 @@ int main() {
     TestTamperedPhase3SchnorrAbortsPeers();
     TestStrictModeMissingPhase1AuxProofAbortsReceiver();
     TestStrictModeLegacyAuxProofEncodingAbortsReceiver();
+    TestStrictModeTamperedPhase1AuxProofAbortsReceiver();
+    TestStrictModeMalformedAuxParamsProofMismatchAbortsReceiver();
     TestStrictModeMissingPhase3SquareFreeProofAbortsReceiver();
+    TestStrictModeTamperedPhase3SquareFreeProofAbortsReceiver();
     TestDevModeAcceptsLegacyPhase1WithoutProofs();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';
