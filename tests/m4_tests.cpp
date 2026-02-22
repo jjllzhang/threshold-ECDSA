@@ -24,7 +24,7 @@ using tecdsa::PartyIndex;
 using tecdsa::Scalar;
 using tecdsa::SessionStatus;
 using tecdsa::SignPhase;
-using tecdsa::SignPhase2StubShare;
+using tecdsa::PaillierPublicKey;
 using tecdsa::SignPhase5Stage;
 using tecdsa::SignSession;
 using tecdsa::SignSessionConfig;
@@ -154,78 +154,14 @@ std::unordered_map<PartyIndex, KeygenResult> RunKeygenAndCollectResults(uint32_t
   return results;
 }
 
-mpz_class NormalizeModQ(const mpz_class& value) {
-  mpz_class normalized = value % Scalar::ModulusQ();
-  if (normalized < 0) {
-    normalized += Scalar::ModulusQ();
-  }
-  return normalized;
-}
-
-std::unordered_map<PartyIndex, Scalar> ComputeLagrangeAtZero(const std::vector<PartyIndex>& participants) {
-  std::unordered_map<PartyIndex, Scalar> out;
-  out.reserve(participants.size());
-
-  for (PartyIndex i : participants) {
-    mpz_class numerator = 1;
-    mpz_class denominator = 1;
-
-    for (PartyIndex j : participants) {
-      if (j == i) {
-        continue;
-      }
-
-      numerator *= NormalizeModQ(-mpz_class(j));
-      numerator %= Scalar::ModulusQ();
-
-      const mpz_class diff = NormalizeModQ(mpz_class(i) - mpz_class(j));
-      if (diff == 0) {
-        throw std::runtime_error("lagrange denominator is zero");
-      }
-      denominator *= diff;
-      denominator %= Scalar::ModulusQ();
-    }
-
-    mpz_class denominator_inv;
-    if (mpz_invert(denominator_inv.get_mpz_t(),
-                   denominator.get_mpz_t(),
-                   Scalar::ModulusQ().get_mpz_t()) == 0) {
-      throw std::runtime_error("failed to invert lagrange denominator");
-    }
-
-    out.emplace(i, Scalar(numerator * denominator_inv));
-  }
-
-  return out;
-}
-
-Scalar ComputeSigningSecretXForSubset(const std::vector<PartyIndex>& signers,
-                                      const std::unordered_map<PartyIndex, KeygenResult>& keygen_results) {
-  const std::unordered_map<PartyIndex, Scalar> lagrange = ComputeLagrangeAtZero(signers);
-
-  Scalar x;
-  for (PartyIndex party : signers) {
-    const auto lagrange_it = lagrange.find(party);
-    const auto keygen_it = keygen_results.find(party);
-    if (lagrange_it == lagrange.end() || keygen_it == keygen_results.end()) {
-      throw std::runtime_error("missing input for signing secret reconstruction");
-    }
-    x = x + (lagrange_it->second * keygen_it->second.x_i);
-  }
-  return x;
-}
-
 struct SignFixture {
   std::vector<PartyIndex> signers;
   Bytes msg32;
   std::unordered_map<PartyIndex, Scalar> fixed_k;
   std::unordered_map<PartyIndex, Scalar> fixed_gamma;
-  std::unordered_map<PartyIndex, SignPhase2StubShare> stub_shares;
 };
 
-SignFixture BuildSignFixture(const std::vector<PartyIndex>& signers,
-                             const std::unordered_map<PartyIndex, KeygenResult>& keygen_results,
-                             bool break_phase5d_check) {
+SignFixture BuildSignFixture(const std::vector<PartyIndex>& signers) {
   SignFixture fixture;
   fixture.signers = signers;
   fixture.msg32 = Bytes{
@@ -234,35 +170,14 @@ SignFixture BuildSignFixture(const std::vector<PartyIndex>& signers,
       0xaa, 0xbb, 0xcc, 0xdd, 0x10, 0x20, 0x30, 0x40,
       0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
   };
-
-  const Scalar x = ComputeSigningSecretXForSubset(signers, keygen_results);
-
-  Scalar gamma_sum;
   for (PartyIndex party : signers) {
     const Scalar gamma_i = Scalar::FromUint64(20 + 2 * party);
     fixture.fixed_gamma.emplace(party, gamma_i);
-    gamma_sum = gamma_sum + gamma_i;
-  }
-  Expect(gamma_sum.value() != 0, "gamma sum must be non-zero for phase3 inversion");
-
-  PartyIndex first_signer = 0;
-  if (!signers.empty()) {
-    first_signer = signers.front();
   }
 
   for (PartyIndex party : signers) {
     const Scalar k_i = Scalar::FromUint64(10 + party);
     fixture.fixed_k.emplace(party, k_i);
-
-    SignPhase2StubShare stub;
-    stub.delta_i = k_i * gamma_sum;
-    stub.sigma_i = k_i * x;
-
-    if (break_phase5d_check && party == first_signer) {
-      stub.sigma_i = stub.sigma_i + Scalar::FromUint64(1);
-    }
-
-    fixture.stub_shares.emplace(party, stub);
   }
 
   return fixture;
@@ -290,6 +205,27 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     all_X_i_subset.emplace(party, x_it->second);
   }
 
+  std::unordered_map<PartyIndex, std::shared_ptr<tecdsa::PaillierProvider>> paillier_private;
+  std::unordered_map<PartyIndex, tecdsa::PaillierPublicKey> paillier_public;
+  paillier_private.reserve(fixture.signers.size());
+  paillier_public.reserve(fixture.signers.size());
+  for (PartyIndex party : fixture.signers) {
+    const auto party_result_it = keygen_results.find(party);
+    if (party_result_it == keygen_results.end()) {
+      throw std::runtime_error("missing keygen result for signer Paillier key");
+    }
+    if (party_result_it->second.local_paillier == nullptr) {
+      throw std::runtime_error("missing local Paillier private key in keygen result");
+    }
+    const auto paillier_pub_it = party_result_it->second.all_paillier_public.find(party);
+    if (paillier_pub_it == party_result_it->second.all_paillier_public.end()) {
+      throw std::runtime_error("missing self Paillier public key in keygen result");
+    }
+
+    paillier_public.emplace(party, paillier_pub_it->second);
+    paillier_private.emplace(party, party_result_it->second.local_paillier);
+  }
+
   for (PartyIndex self_id : fixture.signers) {
     const auto keygen_it = keygen_results.find(self_id);
     if (keygen_it == keygen_results.end()) {
@@ -304,8 +240,9 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     cfg.x_i = keygen_it->second.x_i;
     cfg.y = baseline_it->second.y;
     cfg.all_X_i = all_X_i_subset;
+    cfg.all_paillier_public = paillier_public;
+    cfg.local_paillier = paillier_private.at(self_id);
     cfg.msg32 = fixture.msg32;
-    cfg.phase2_stub_shares = fixture.stub_shares;
     cfg.fixed_k_i = fixture.fixed_k.at(self_id);
     cfg.fixed_gamma_i = fixture.fixed_gamma.at(self_id);
 
@@ -360,9 +297,12 @@ std::vector<Envelope> CollectPhase1Messages(std::vector<std::unique_ptr<SignSess
 
 std::vector<Envelope> CollectPhase2Messages(std::vector<std::unique_ptr<SignSession>>* sessions) {
   std::vector<Envelope> out;
-  out.reserve(sessions->size());
   for (auto& session : *sessions) {
-    out.push_back(session->BuildPhase2StubEnvelope());
+    if (session->phase() != SignPhase::kPhase2) {
+      continue;
+    }
+    std::vector<Envelope> batch = session->BuildPhase2MtaEnvelopes();
+    out.insert(out.end(), batch.begin(), batch.end());
   }
   return out;
 }
@@ -450,7 +390,24 @@ void RunToPhase5D(std::vector<std::unique_ptr<SignSession>>* sessions,
   DeliverSignEnvelopesOrThrow(CollectPhase1Messages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase2);
 
-  DeliverSignEnvelopesOrThrow(CollectPhase2Messages(sessions), signers, sessions);
+  for (size_t round = 0; round < 32; ++round) {
+    const std::vector<Envelope> phase2_messages = CollectPhase2Messages(sessions);
+    if (phase2_messages.empty()) {
+      throw std::runtime_error("phase2 stalled before MtA/MtAwc completion");
+    }
+    DeliverSignEnvelopesOrThrow(phase2_messages, signers, sessions);
+
+    bool all_phase3 = true;
+    for (const auto& session : *sessions) {
+      if (session->phase() != SignPhase::kPhase3) {
+        all_phase3 = false;
+        break;
+      }
+    }
+    if (all_phase3) {
+      break;
+    }
+  }
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase3);
 
   DeliverSignEnvelopesOrThrow(CollectPhase3Messages(sessions), signers, sessions);
@@ -473,7 +430,7 @@ void TestM4SignEndToEndProducesVerifiableSignature() {
   const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD1, 0x03, 0x01});
 
   const std::vector<PartyIndex> signers = {1, 2};
-  const SignFixture fixture = BuildSignFixture(signers, keygen_results, /*break_phase5d_check=*/false);
+  const SignFixture fixture = BuildSignFixture(signers);
   auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE1, 0x02, 0x01});
 
   RunToPhase5D(&sessions, signers);
@@ -508,12 +465,15 @@ void TestM4Phase5DFailurePreventsPhase5EReveal() {
   const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD2, 0x03, 0x01});
 
   const std::vector<PartyIndex> signers = {1, 2};
-  const SignFixture bad_fixture = BuildSignFixture(signers, keygen_results, /*break_phase5d_check=*/true);
+  const SignFixture bad_fixture = BuildSignFixture(signers);
   auto sessions = BuildSignSessions(bad_fixture, keygen_results, Bytes{0xE2, 0x02, 0x01});
 
   RunToPhase5D(&sessions, signers);
 
-  const std::vector<Envelope> phase5d = CollectPhase5DMessages(&sessions);
+  std::vector<Envelope> phase5d = CollectPhase5DMessages(&sessions);
+  if (!phase5d.empty() && !phase5d.front().payload.empty()) {
+    phase5d.front().payload.back() ^= 0x01;
+  }
   for (const Envelope& envelope : phase5d) {
     (void)DeliverSignEnvelope(envelope, signers, &sessions);
   }
@@ -524,19 +484,63 @@ void TestM4Phase5DFailurePreventsPhase5EReveal() {
       any_aborted = true;
     }
   }
-  Expect(any_aborted, "At least one party must abort at phase5D when sigma stub is wrong");
+  Expect(any_aborted, "At least one party must abort at phase5D when open payload is tampered");
 
   for (auto& session : sessions) {
-    Expect(session->status() == SessionStatus::kAborted,
-           "Session must abort on phase5D consistency failure");
-    Expect(session->phase() == SignPhase::kPhase5,
-           "Session should remain in phase5 after abort");
-    Expect(session->phase5_stage() == SignPhase5Stage::kPhase5D,
-           "Session must not advance to phase5E after phase5D failure");
-    Expect(!session->HasResult(), "Aborted session must not expose final signature");
-    ExpectThrow([&]() { (void)session->BuildPhase5ERevealEnvelope(); },
-                "Aborted session cannot build phase5E reveal envelope");
+    if (session->status() == SessionStatus::kAborted) {
+      Expect(session->phase() == SignPhase::kPhase5,
+             "Aborted session should remain in phase5");
+      Expect(session->phase5_stage() == SignPhase5Stage::kPhase5D,
+             "Aborted session must stay at phase5D");
+      ExpectThrow([&]() { (void)session->BuildPhase5ERevealEnvelope(); },
+                  "Aborted session cannot build phase5E reveal envelope");
+    } else {
+      Expect(session->status() == SessionStatus::kRunning,
+             "Non-aborted peers should remain running after remote phase5D failure");
+      Expect(session->phase() == SignPhase::kPhase5,
+             "Non-aborted peers should remain in phase5");
+      Expect(session->phase5_stage() == SignPhase5Stage::kPhase5D ||
+                 session->phase5_stage() == SignPhase5Stage::kPhase5E,
+             "Non-aborted peers may stay at phase5D or wait in phase5E");
+    }
+    Expect(!session->HasResult(), "Failure path must not expose final signature");
   }
+}
+
+void TestM5Phase2InstanceIdMismatchAborts() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD3, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE3, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  DeliverSignEnvelopesOrThrow(CollectPhase2Messages(&sessions), signers, &sessions);
+
+  std::vector<Envelope> phase2_round2 = CollectPhase2Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase2_round2) {
+    if (envelope.type == SignSession::Phase2ResponseMessageType() && envelope.payload.size() > 8) {
+      envelope.payload[8] ^= 0x01;
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate a phase2 response envelope to tamper");
+
+  for (const Envelope& envelope : phase2_round2) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  bool any_aborted = false;
+  for (const auto& session : sessions) {
+    if (session->status() == SessionStatus::kAborted) {
+      any_aborted = true;
+    }
+    Expect(!session->HasResult(), "Phase2-aborted session must not expose final signature");
+  }
+  Expect(any_aborted, "At least one signer must abort on mismatched phase2 instance id");
 }
 
 }  // namespace
@@ -545,11 +549,12 @@ int main() {
   try {
     TestM4SignEndToEndProducesVerifiableSignature();
     TestM4Phase5DFailurePreventsPhase5EReveal();
+    TestM5Phase2InstanceIdMismatchAborts();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';
     return 1;
   }
 
-  std::cout << "M4 tests passed" << '\n';
+  std::cout << "M4/M5 tests passed" << '\n';
   return 0;
 }

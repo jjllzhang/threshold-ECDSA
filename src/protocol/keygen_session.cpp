@@ -21,6 +21,9 @@ constexpr size_t kCommitmentLen = 32;
 constexpr size_t kPointCompressedLen = 33;
 constexpr size_t kScalarLen = 32;
 constexpr size_t kMaxOpenRandomnessLen = 1024;
+constexpr size_t kMaxPaillierModulusFieldLen = 8192;
+constexpr uint32_t kMinPaillierKeygenBits = 2048;
+constexpr size_t kMaxPaillierKeygenAttempts = 32;
 constexpr char kPhase1CommitDomain[] = "GG2019/keygen/phase1";
 constexpr char kSchnorrProofId[] = "GG2019/Schnorr/v1";
 
@@ -138,6 +141,19 @@ Scalar ReadScalar(std::span<const uint8_t> input, size_t* offset) {
   return Scalar::FromCanonicalBytes(view);
 }
 
+void AppendMpzField(const mpz_class& value, Bytes* out) {
+  const Bytes encoded = EncodeMpz(value);
+  AppendSizedField(encoded, out);
+}
+
+mpz_class ReadMpzField(std::span<const uint8_t> input,
+                       size_t* offset,
+                       size_t max_len,
+                       const char* field_name) {
+  const Bytes encoded = ReadSizedField(input, offset, max_len, field_name);
+  return DecodeMpz(encoded, max_len);
+}
+
 Bytes PartyIdToBytes(PartyIndex id) {
   Bytes out;
   out.reserve(4);
@@ -193,16 +209,35 @@ Scalar BuildSchnorrChallenge(const Bytes& session_id,
   return transcript.challenge_scalar_mod_q();
 }
 
+const mpz_class& MinPaillierModulusQ8() {
+  static const mpz_class q_to_8 = []() {
+    mpz_class out;
+    mpz_pow_ui(out.get_mpz_t(), Scalar::ModulusQ().get_mpz_t(), 8);
+    return out;
+  }();
+  return q_to_8;
+}
+
+void ValidatePaillierPublicKeyOrThrow(const PaillierPublicKey& pub) {
+  if (pub.n <= MinPaillierModulusQ8()) {
+    throw std::invalid_argument("Paillier modulus must satisfy N > q^8");
+  }
+}
+
 }  // namespace
 
 KeygenSession::KeygenSession(KeygenSessionConfig cfg)
     : Session(std::move(cfg.session_id), cfg.self_id, cfg.timeout),
       participants_(std::move(cfg.participants)),
       threshold_(cfg.threshold),
+      paillier_modulus_bits_(cfg.paillier_modulus_bits),
       peers_(BuildPeerSet(participants_, cfg.self_id)) {
   ValidateParticipantsOrThrow(participants_, cfg.self_id);
   if (threshold_ >= participants_.size()) {
     throw std::invalid_argument("threshold must be less than participant count");
+  }
+  if (paillier_modulus_bits_ < kMinPaillierKeygenBits) {
+    throw std::invalid_argument("paillier_modulus_bits must be >= 2048");
   }
 }
 
@@ -321,14 +356,21 @@ Envelope KeygenSession::BuildPhase1CommitEnvelope() {
   }
 
   EnsureLocalPolynomialPrepared();
+  EnsureLocalPaillierPrepared();
   phase1_commitments_[self_id()] = local_commitment_;
+  result_.all_paillier_public[self_id()] = local_paillier_public_;
+
+  Bytes payload;
+  payload.reserve(kCommitmentLen + 4 + 512);
+  payload.insert(payload.end(), local_commitment_.begin(), local_commitment_.end());
+  AppendMpzField(local_paillier_public_.n, &payload);
 
   Envelope out;
   out.session_id = session_id();
   out.from = self_id();
   out.to = kBroadcastPartyId;
   out.type = MessageTypeForPhase(KeygenPhase::kPhase1);
-  out.payload = local_commitment_;
+  out.payload = std::move(payload);
   return out;
 }
 
@@ -431,7 +473,9 @@ Envelope KeygenSession::BuildPhase3XiProofEnvelope() {
 bool KeygenSession::HasResult() const {
   return status() == SessionStatus::kCompleted && phase_ == KeygenPhase::kCompleted &&
          phase2_aggregates_ready_ && local_phase3_ready_ &&
-         result_.all_X_i.size() == participants_.size();
+         result_.all_X_i.size() == participants_.size() &&
+         result_.all_paillier_public.size() == participants_.size() &&
+         result_.local_paillier != nullptr;
 }
 
 const KeygenResult& KeygenSession::result() const {
@@ -488,18 +532,57 @@ void KeygenSession::EnsureLocalPolynomialPrepared() {
   local_open_randomness_ = commit.randomness;
 }
 
-bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
-  if (envelope.payload.size() != kCommitmentLen) {
-    Abort("invalid keygen phase1 commitment payload length");
-    return false;
+void KeygenSession::EnsureLocalPaillierPrepared() {
+  if (local_paillier_ != nullptr) {
+    return;
   }
 
+  for (size_t attempt = 0; attempt < kMaxPaillierKeygenAttempts; ++attempt) {
+    auto candidate = std::make_shared<PaillierProvider>(paillier_modulus_bits_);
+    PaillierPublicKey candidate_pub{.n = candidate->modulus_n()};
+    if (candidate_pub.n > MinPaillierModulusQ8()) {
+      local_paillier_ = std::move(candidate);
+      local_paillier_public_ = std::move(candidate_pub);
+      result_.local_paillier = local_paillier_;
+      result_.all_paillier_public[self_id()] = local_paillier_public_;
+      return;
+    }
+  }
+
+  throw std::runtime_error("failed to generate Paillier modulus N > q^8");
+}
+
+bool KeygenSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
   const bool inserted = seen_phase1_.insert(envelope.from).second;
   if (!inserted) {
     return true;
   }
 
-  phase1_commitments_[envelope.from] = envelope.payload;
+  try {
+    if (envelope.payload.size() < kCommitmentLen + 4 + 1) {
+      throw std::invalid_argument("phase1 payload is too short");
+    }
+
+    size_t offset = 0;
+    Bytes commitment(envelope.payload.begin(), envelope.payload.begin() + static_cast<std::ptrdiff_t>(kCommitmentLen));
+    offset += kCommitmentLen;
+
+    const mpz_class paillier_n = ReadMpzField(
+        envelope.payload, &offset, kMaxPaillierModulusFieldLen, "keygen phase1 Paillier modulus");
+    if (offset != envelope.payload.size()) {
+      throw std::invalid_argument("keygen phase1 payload has trailing bytes");
+    }
+
+    const PaillierPublicKey pub{.n = paillier_n};
+    ValidatePaillierPublicKeyOrThrow(pub);
+
+    phase1_commitments_[envelope.from] = std::move(commitment);
+    result_.all_paillier_public[envelope.from] = pub;
+  } catch (const std::exception& ex) {
+    Abort(std::string("invalid keygen phase1 payload: ") + ex.what());
+    return false;
+  }
+
   Touch();
   MaybeAdvanceAfterPhase1();
   return true;
@@ -683,6 +766,12 @@ void KeygenSession::MaybeAdvanceAfterPhase1() {
     return;
   }
   if (seen_phase1_.size() != peers_.size()) {
+    return;
+  }
+  if (phase1_commitments_.size() != participants_.size()) {
+    return;
+  }
+  if (result_.all_paillier_public.size() != participants_.size()) {
     return;
   }
   phase_ = KeygenPhase::kPhase2;

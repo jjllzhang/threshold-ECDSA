@@ -14,6 +14,10 @@ struct PaillierCiphertextWithRandom {
   mpz_class randomness;
 };
 
+struct PaillierPublicKey {
+  mpz_class n;
+};
+
 class PaillierProvider {
  public:
   explicit PaillierProvider(unsigned long modulus_bits);

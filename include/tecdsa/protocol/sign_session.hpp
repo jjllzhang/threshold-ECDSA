@@ -1,11 +1,14 @@
 #pragma once
 
 #include <optional>
+#include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "tecdsa/crypto/ec_point.hpp"
+#include "tecdsa/crypto/paillier.hpp"
 #include "tecdsa/crypto/scalar.hpp"
 #include "tecdsa/net/envelope.hpp"
 #include "tecdsa/protocol/session.hpp"
@@ -33,6 +36,7 @@ enum class SignPhase5Stage : uint32_t {
 enum class SignMessageType : uint32_t {
   kPhase1 = 2001,
   kPhase2 = 2002,
+  kPhase2Response = 2010,
   kPhase3 = 2003,
   kPhase4 = 2004,
   kPhase5A = 2005,
@@ -41,11 +45,6 @@ enum class SignMessageType : uint32_t {
   kPhase5D = 2008,
   kPhase5E = 2009,
   kAbort = 2099,
-};
-
-struct SignPhase2StubShare {
-  Scalar delta_i;
-  Scalar sigma_i;
 };
 
 struct SignSessionConfig {
@@ -57,9 +56,9 @@ struct SignSessionConfig {
   Scalar x_i;
   ECPoint y;
   std::unordered_map<PartyIndex, ECPoint> all_X_i;
+  std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public;
+  std::shared_ptr<PaillierProvider> local_paillier;
   Bytes msg32;
-
-  std::unordered_map<PartyIndex, SignPhase2StubShare> phase2_stub_shares;
 
   std::optional<Scalar> fixed_k_i;
   std::optional<Scalar> fixed_gamma_i;
@@ -85,7 +84,7 @@ class SignSession : public Session {
   size_t received_peer_count_in_phase() const;
 
   Envelope BuildPhase1CommitEnvelope();
-  Envelope BuildPhase2StubEnvelope();
+  std::vector<Envelope> BuildPhase2MtaEnvelopes();
   Envelope BuildPhase3DeltaEnvelope();
   Envelope BuildPhase4OpenGammaEnvelope();
   Envelope BuildPhase5ACommitEnvelope();
@@ -102,8 +101,22 @@ class SignSession : public Session {
 
   static uint32_t MessageTypeForPhase(SignPhase phase);
   static uint32_t MessageTypeForPhase5Stage(SignPhase5Stage stage);
+  static uint32_t Phase2ResponseMessageType();
 
  private:
+  enum class MtaType : uint8_t {
+    kTimesGamma = 1,
+    kTimesW = 2,
+  };
+
+  struct Phase2InitiatorInstance {
+    PartyIndex responder = 0;
+    MtaType type = MtaType::kTimesGamma;
+    Bytes instance_id;
+    mpz_class c1;
+    bool response_received = false;
+  };
+
   struct Phase4OpenData {
     ECPoint gamma_i;
     Bytes randomness;
@@ -122,7 +135,8 @@ class SignSession : public Session {
   };
 
   bool HandlePhase1CommitEnvelope(const Envelope& envelope);
-  bool HandlePhase2StubEnvelope(const Envelope& envelope);
+  bool HandlePhase2InitEnvelope(const Envelope& envelope);
+  bool HandlePhase2ResponseEnvelope(const Envelope& envelope);
   bool HandlePhase3DeltaEnvelope(const Envelope& envelope);
   bool HandlePhase4OpenEnvelope(const Envelope& envelope);
   bool HandlePhase5ACommitEnvelope(const Envelope& envelope);
@@ -133,6 +147,8 @@ class SignSession : public Session {
 
   void PrepareResharedSigningShares();
   void PreparePhase1SecretsIfNeeded();
+  void InitializePhase2InstancesIfNeeded();
+  void MaybeFinalizePhase2AndAdvance();
   void ComputeDeltaInverseAndAdvanceToPhase4();
   void ComputeRAndAdvanceToPhase5();
   void ComputePhase5VAAndAdvanceToStage5C();
@@ -152,7 +168,8 @@ class SignSession : public Session {
   std::vector<PartyIndex> participants_;
   std::unordered_set<PartyIndex> peers_;
   std::unordered_map<PartyIndex, ECPoint> all_X_i_;
-  std::unordered_map<PartyIndex, SignPhase2StubShare> phase2_stub_shares_;
+  std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public_;
+  std::shared_ptr<PaillierProvider> local_paillier_;
 
   Scalar local_x_i_;
   ECPoint public_key_y_;
@@ -185,7 +202,14 @@ class SignSession : public Session {
   std::unordered_set<PartyIndex> seen_phase5e_;
 
   std::unordered_map<PartyIndex, Bytes> phase1_commitments_;
-  std::unordered_map<PartyIndex, SignPhase2StubShare> phase2_received_shares_;
+  std::vector<Envelope> phase2_outbox_;
+  bool phase2_instances_initialized_ = false;
+  std::unordered_map<std::string, Phase2InitiatorInstance> phase2_initiator_instances_;
+  std::unordered_map<std::string, std::string> phase2_responder_requests_seen_;
+  Scalar phase2_mta_initiator_sum_;
+  Scalar phase2_mta_responder_sum_;
+  Scalar phase2_mtawc_initiator_sum_;
+  Scalar phase2_mtawc_responder_sum_;
   std::unordered_map<PartyIndex, Scalar> phase3_delta_shares_;
   std::unordered_map<PartyIndex, Phase4OpenData> phase4_open_data_;
   std::unordered_map<PartyIndex, Bytes> phase5a_commitments_;

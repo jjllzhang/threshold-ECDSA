@@ -1,6 +1,7 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -21,7 +22,7 @@ using tecdsa::KeygenSessionConfig;
 using tecdsa::SessionRouter;
 using tecdsa::SessionStatus;
 using tecdsa::SignPhase;
-using tecdsa::SignPhase2StubShare;
+using tecdsa::PaillierPublicKey;
 using tecdsa::SignPhase5Stage;
 using tecdsa::SignSession;
 using tecdsa::SignSessionConfig;
@@ -131,6 +132,7 @@ void TestKeygenSessionSkeleton() {
   KeygenSession peer2(std::move(peer2_cfg));
   KeygenSession peer3(std::move(peer3_cfg));
   Expect(session.phase() == KeygenPhase::kPhase1, "Keygen starts at phase1");
+  (void)session.BuildPhase1CommitEnvelope();
 
   Expect(session.HandleEnvelope(peer2.BuildPhase1CommitEnvelope()),
          "Keygen should accept phase1 msg from peer2");
@@ -155,18 +157,19 @@ void TestSignSessionSkeletonAndTimeout() {
   all_x_i.emplace(2, tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(5)));
   const tecdsa::ECPoint y = tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(1));
 
-  std::unordered_map<tecdsa::PartyIndex, SignPhase2StubShare> phase2_stub;
-  phase2_stub.emplace(1, SignPhase2StubShare{.delta_i = Scalar::FromUint64(506),
-                                              .sigma_i = Scalar::FromUint64(11)});
-  phase2_stub.emplace(2, SignPhase2StubShare{.delta_i = Scalar::FromUint64(552),
-                                              .sigma_i = Scalar::FromUint64(12)});
+  auto paillier_1 = std::make_shared<tecdsa::PaillierProvider>(/*modulus_bits=*/1024);
+  auto paillier_2 = std::make_shared<tecdsa::PaillierProvider>(/*modulus_bits=*/1024);
+  std::unordered_map<tecdsa::PartyIndex, PaillierPublicKey> paillier_public;
+  paillier_public.emplace(1, PaillierPublicKey{.n = paillier_1->modulus_n()});
+  paillier_public.emplace(2, PaillierPublicKey{.n = paillier_2->modulus_n()});
 
   auto build_cfg = [&](tecdsa::PartyIndex self_id,
                        uint64_t x_i_value,
                        uint64_t fixed_k,
                        uint64_t fixed_gamma,
                        const Bytes& session_id,
-                       std::chrono::milliseconds timeout) {
+                       std::chrono::milliseconds timeout,
+                       std::shared_ptr<tecdsa::PaillierProvider> local_paillier) {
     SignSessionConfig cfg;
     cfg.session_id = session_id;
     cfg.self_id = self_id;
@@ -175,13 +178,14 @@ void TestSignSessionSkeletonAndTimeout() {
     cfg.x_i = Scalar::FromUint64(x_i_value);
     cfg.y = y;
     cfg.all_X_i = all_x_i;
+    cfg.all_paillier_public = paillier_public;
+    cfg.local_paillier = std::move(local_paillier);
     cfg.msg32 = Bytes{
         0x4d, 0x32, 0x2d, 0x73, 0x69, 0x67, 0x6e, 0x2d,
         0x73, 0x6b, 0x65, 0x6c, 0x65, 0x74, 0x6f, 0x6e,
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
         0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
     };
-    cfg.phase2_stub_shares = phase2_stub;
     cfg.fixed_k_i = Scalar::FromUint64(fixed_k);
     cfg.fixed_gamma_i = Scalar::FromUint64(fixed_gamma);
     return cfg;
@@ -192,13 +196,15 @@ void TestSignSessionSkeletonAndTimeout() {
                                  /*fixed_k=*/11,
                                  /*fixed_gamma=*/22,
                                  Bytes{2, 2, 2},
-                                 std::chrono::seconds(5)));
+                                 std::chrono::seconds(5),
+                                 paillier_1));
   SignSession session2(build_cfg(/*self_id=*/2,
                                  /*x_i_value=*/5,
                                  /*fixed_k=*/12,
                                  /*fixed_gamma=*/24,
                                  Bytes{2, 2, 2},
-                                 std::chrono::seconds(5)));
+                                 std::chrono::seconds(5),
+                                 paillier_2));
 
   auto deliver_between_two = [&](const Envelope& envelope) {
     if (envelope.from == 1) {
@@ -219,7 +225,32 @@ void TestSignSessionSkeletonAndTimeout() {
   Expect(session1.phase() == SignPhase::kPhase2 && session2.phase() == SignPhase::kPhase2,
          "Sign sessions should enter phase2");
 
-  deliver_stage(session1.BuildPhase2StubEnvelope(), session2.BuildPhase2StubEnvelope(), "phase2");
+  auto drive_phase2 = [&]() {
+    for (size_t round = 0; round < 12; ++round) {
+      std::vector<Envelope> outbox;
+      if (session1.phase() == SignPhase::kPhase2) {
+        std::vector<Envelope> batch = session1.BuildPhase2MtaEnvelopes();
+        outbox.insert(outbox.end(), batch.begin(), batch.end());
+      }
+      if (session2.phase() == SignPhase::kPhase2) {
+        std::vector<Envelope> batch = session2.BuildPhase2MtaEnvelopes();
+        outbox.insert(outbox.end(), batch.begin(), batch.end());
+      }
+
+      for (const Envelope& envelope : outbox) {
+        Expect(deliver_between_two(envelope), "phase2: peer should accept MtA/MtAwc envelope");
+      }
+
+      if (session1.phase() == SignPhase::kPhase3 && session2.phase() == SignPhase::kPhase3) {
+        return;
+      }
+      if (outbox.empty()) {
+        throw std::runtime_error("phase2 stalled before all MtA/MtAwc messages completed");
+      }
+    }
+    throw std::runtime_error("phase2 exceeded maximum rounds in skeleton test");
+  };
+  drive_phase2();
   Expect(session1.phase() == SignPhase::kPhase3 && session2.phase() == SignPhase::kPhase3,
          "Sign sessions should enter phase3");
 
@@ -275,7 +306,8 @@ void TestSignSessionSkeletonAndTimeout() {
                           /*fixed_k=*/11,
                           /*fixed_gamma=*/22,
                           Bytes{3, 3, 3},
-                          std::chrono::milliseconds(1));
+                          std::chrono::milliseconds(1),
+                          paillier_1);
 
   SignSession timeout_session(std::move(timeout_cfg));
   const auto far_future = std::chrono::steady_clock::now() + std::chrono::seconds(1);

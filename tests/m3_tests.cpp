@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/net/envelope.hpp"
 #include "tecdsa/protocol/keygen_session.hpp"
 
@@ -18,6 +19,7 @@ using tecdsa::KeygenResult;
 using tecdsa::KeygenSession;
 using tecdsa::KeygenSessionConfig;
 using tecdsa::PartyIndex;
+using tecdsa::Scalar;
 using tecdsa::SessionStatus;
 
 void Expect(bool condition, const std::string& message) {
@@ -147,6 +149,13 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
                                    uint32_t n) {
   const KeygenResult& baseline = sessions.front()->result();
   Expect(baseline.all_X_i.size() == n, "Baseline keygen result must contain all X_i values");
+  Expect(baseline.all_paillier_public.size() == n,
+         "Baseline keygen result must contain all Paillier public keys");
+  Expect(baseline.local_paillier != nullptr,
+         "Baseline keygen result must expose local Paillier provider");
+
+  mpz_class min_paillier_n;
+  mpz_pow_ui(min_paillier_n.get_mpz_t(), Scalar::ModulusQ().get_mpz_t(), 8);
 
   for (size_t idx = 0; idx < sessions.size(); ++idx) {
     const PartyIndex self_id = static_cast<PartyIndex>(idx + 1);
@@ -156,6 +165,10 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
            "All sessions must derive the same group public key y");
     Expect(current.all_X_i.size() == baseline.all_X_i.size(),
            "All sessions must agree on the number of public shares");
+    Expect(current.all_paillier_public.size() == baseline.all_paillier_public.size(),
+           "All sessions must agree on the number of Paillier public keys");
+    Expect(current.local_paillier != nullptr,
+           "Each session result must expose local Paillier provider");
 
     for (const auto& [party_id, expected_x_i] : baseline.all_X_i) {
       const auto it = current.all_X_i.find(party_id);
@@ -170,6 +183,22 @@ void AssertKeygenOutputsConsistent(const std::vector<std::unique_ptr<KeygenSessi
            "Session result must contain its own X_i entry");
     Expect(self_it->second == current.X_i,
            "Session result must expose X_i equal to all_X_i[self]");
+
+    for (const auto& [party_id, expected_pub] : baseline.all_paillier_public) {
+      const auto it = current.all_paillier_public.find(party_id);
+      Expect(it != current.all_paillier_public.end(),
+             "Session result is missing Paillier public key for party " + std::to_string(party_id));
+      Expect(it->second.n == expected_pub.n,
+             "Session result has mismatched Paillier modulus for party " + std::to_string(party_id));
+      Expect(it->second.n > min_paillier_n,
+             "Session result has Paillier modulus that does not satisfy N > q^8");
+    }
+
+    const auto self_paillier_it = current.all_paillier_public.find(self_id);
+    Expect(self_paillier_it != current.all_paillier_public.end(),
+           "Session result must contain its own Paillier public key entry");
+    Expect(self_paillier_it->second.n == current.local_paillier->modulus_n(),
+           "Session local Paillier private key must match broadcast public key");
   }
 }
 
@@ -225,6 +254,45 @@ void TestTamperedPhase2ShareAbortsReceiver() {
          "Receiver must abort when a dealer share is tampered");
 }
 
+void TestTamperedPhase1PaillierModulusAbortsReceiver() {
+  auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xB2, 0x03, 0x01});
+
+  std::vector<Envelope> phase1 = BuildAndCollectPhase1(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase1) {
+    if (envelope.from != 1) {
+      continue;
+    }
+
+    Bytes malformed_payload;
+    malformed_payload.insert(malformed_payload.end(), envelope.payload.begin(), envelope.payload.begin() + 32);
+
+    const Bytes tiny_n = tecdsa::EncodeMpz(mpz_class(17));
+    auto append_u32 = [](uint32_t value, Bytes* out) {
+      out->push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+      out->push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+      out->push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+      out->push_back(static_cast<uint8_t>(value & 0xFF));
+    };
+    append_u32(static_cast<uint32_t>(tiny_n.size()), &malformed_payload);
+    malformed_payload.insert(malformed_payload.end(), tiny_n.begin(), tiny_n.end());
+
+    envelope.payload = std::move(malformed_payload);
+    tampered = true;
+    break;
+  }
+  Expect(tampered, "Test setup failed to locate a phase1 payload to tamper");
+
+  for (const Envelope& envelope : phase1) {
+    (void)DeliverEnvelope(envelope, &sessions);
+  }
+
+  Expect(sessions[1]->status() == SessionStatus::kAborted,
+         "Peer 2 must abort when phase1 Paillier modulus is too small");
+  Expect(sessions[2]->status() == SessionStatus::kAborted,
+         "Peer 3 must abort when phase1 Paillier modulus is too small");
+}
+
 void TestTamperedPhase3SchnorrAbortsPeers() {
   auto sessions = BuildSessions(/*n=*/3, /*t=*/1, Bytes{0xC1, 0x03, 0x01});
 
@@ -262,6 +330,7 @@ int main() {
   try {
     TestKeygenConsistencyN3T1();
     TestKeygenConsistencyN5T2();
+    TestTamperedPhase1PaillierModulusAbortsReceiver();
     TestTamperedPhase2ShareAbortsReceiver();
     TestTamperedPhase3SchnorrAbortsPeers();
   } catch (const std::exception& ex) {

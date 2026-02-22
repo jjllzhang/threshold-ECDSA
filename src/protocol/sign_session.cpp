@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -15,6 +16,7 @@ extern "C" {
 }
 
 #include "tecdsa/crypto/commitment.hpp"
+#include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/crypto/random.hpp"
 
 namespace tecdsa {
@@ -24,6 +26,8 @@ constexpr size_t kCommitmentLen = 32;
 constexpr size_t kPointCompressedLen = 33;
 constexpr size_t kScalarLen = 32;
 constexpr size_t kMaxOpenRandomnessLen = 1024;
+constexpr size_t kMtaInstanceIdLen = 16;
+constexpr size_t kMaxMpzEncodedLen = 8192;
 constexpr char kPhase1CommitDomain[] = "GG2019/sign/phase1";
 constexpr char kPhase5ACommitDomain[] = "GG2019/sign/phase5A";
 constexpr char kPhase5CCommitDomain[] = "GG2019/sign/phase5C";
@@ -140,6 +144,79 @@ Scalar ReadScalar(std::span<const uint8_t> input, size_t* offset) {
   const std::span<const uint8_t> view = input.subspan(*offset, kScalarLen);
   *offset += kScalarLen;
   return Scalar::FromCanonicalBytes(view);
+}
+
+void AppendMpzField(const mpz_class& value, Bytes* out) {
+  const Bytes encoded = EncodeMpz(value);
+  AppendSizedField(encoded, out);
+}
+
+mpz_class ReadMpzField(std::span<const uint8_t> input,
+                       size_t* offset,
+                       size_t max_len,
+                       const char* field_name) {
+  const Bytes encoded = ReadSizedField(input, offset, max_len, field_name);
+  return DecodeMpz(encoded, max_len);
+}
+
+std::string BytesToKey(const Bytes& bytes) {
+  return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+std::string MakeResponderRequestKey(PartyIndex initiator, uint8_t type_code) {
+  std::string out;
+  out.reserve(8);
+  out.push_back(static_cast<char>((initiator >> 24) & 0xFF));
+  out.push_back(static_cast<char>((initiator >> 16) & 0xFF));
+  out.push_back(static_cast<char>((initiator >> 8) & 0xFF));
+  out.push_back(static_cast<char>(initiator & 0xFF));
+  out.push_back(static_cast<char>(type_code));
+  return out;
+}
+
+mpz_class RandomBelow(const mpz_class& upper_exclusive) {
+  if (upper_exclusive <= 0) {
+    throw std::invalid_argument("random upper bound must be positive");
+  }
+
+  const size_t bit_len = mpz_sizeinbase(upper_exclusive.get_mpz_t(), 2);
+  const size_t byte_len = std::max<size_t>(1, (bit_len + 7) / 8);
+
+  while (true) {
+    const Bytes random = Csprng::RandomBytes(byte_len);
+    mpz_class candidate;
+    mpz_import(candidate.get_mpz_t(), random.size(), 1, sizeof(uint8_t), 1, 0, random.data());
+    if (candidate < upper_exclusive) {
+      return candidate;
+    }
+  }
+}
+
+mpz_class SampleZnStar(const mpz_class& modulus_n) {
+  if (modulus_n <= 2) {
+    throw std::invalid_argument("Paillier modulus must be > 2");
+  }
+
+  mpz_class candidate;
+  mpz_class gcd;
+  do {
+    candidate = RandomBelow(modulus_n);
+    mpz_gcd(gcd.get_mpz_t(), candidate.get_mpz_t(), modulus_n.get_mpz_t());
+  } while (candidate == 0 || gcd != 1);
+
+  return candidate;
+}
+
+Bytes RandomMtaInstanceId() {
+  return Csprng::RandomBytes(kMtaInstanceIdLen);
+}
+
+mpz_class ModN2Normalize(const mpz_class& value, const mpz_class& n2) {
+  mpz_class out = value % n2;
+  if (out < 0) {
+    out += n2;
+  }
+  return out;
 }
 
 Scalar RandomNonZeroScalar() {
@@ -304,7 +381,8 @@ SignSession::SignSession(SignSessionConfig cfg)
       participants_(std::move(cfg.participants)),
       peers_(BuildPeerSet(participants_, cfg.self_id)),
       all_X_i_(std::move(cfg.all_X_i)),
-      phase2_stub_shares_(std::move(cfg.phase2_stub_shares)),
+      all_paillier_public_(std::move(cfg.all_paillier_public)),
+      local_paillier_(std::move(cfg.local_paillier)),
       local_x_i_(cfg.x_i),
       public_key_y_(cfg.y),
       msg32_(std::move(cfg.msg32)),
@@ -318,14 +396,28 @@ SignSession::SignSession(SignSessionConfig cfg)
   if (local_x_i_.value() == 0) {
     throw std::invalid_argument("local x_i share must be non-zero");
   }
+  if (local_paillier_ == nullptr) {
+    throw std::invalid_argument("local Paillier provider must be present");
+  }
 
   for (PartyIndex party : participants_) {
     if (!all_X_i_.contains(party)) {
       throw std::invalid_argument("all_X_i is missing participant public share");
     }
-    if (!phase2_stub_shares_.contains(party)) {
-      throw std::invalid_argument("phase2_stub_shares must include all participants");
+    const auto paillier_it = all_paillier_public_.find(party);
+    if (paillier_it == all_paillier_public_.end()) {
+      throw std::invalid_argument("all_paillier_public is missing participant key");
     }
+    if (paillier_it->second.n <= 1) {
+      throw std::invalid_argument("Paillier modulus must be > 1");
+    }
+  }
+  const auto self_pk_it = all_paillier_public_.find(self_id());
+  if (self_pk_it == all_paillier_public_.end()) {
+    throw std::invalid_argument("missing self Paillier public key");
+  }
+  if (self_pk_it->second.n != local_paillier_->modulus_n()) {
+    throw std::invalid_argument("self Paillier public key does not match local provider");
   }
 
   message_scalar_ = Scalar::FromBigEndianModQ(msg32_);
@@ -345,7 +437,7 @@ size_t SignSession::received_peer_count_in_phase() const {
     case SignPhase::kPhase1:
       return seen_phase1_.size();
     case SignPhase::kPhase2:
-      return seen_phase2_.size();
+      return std::min(phase2_initiator_instances_.size(), phase2_responder_requests_seen_.size()) / 2;
     case SignPhase::kPhase3:
       return seen_phase3_.size();
     case SignPhase::kPhase4:
@@ -396,36 +488,18 @@ Envelope SignSession::BuildPhase1CommitEnvelope() {
   return out;
 }
 
-Envelope SignSession::BuildPhase2StubEnvelope() {
+std::vector<Envelope> SignSession::BuildPhase2MtaEnvelopes() {
   if (IsTerminal()) {
-    throw std::logic_error("cannot build phase2 envelope for terminal sign session");
+    throw std::logic_error("cannot build phase2 envelopes for terminal sign session");
   }
   if (phase_ != SignPhase::kPhase2) {
-    throw std::logic_error("BuildPhase2StubEnvelope must be called in sign phase2");
+    throw std::logic_error("BuildPhase2MtaEnvelopes must be called in sign phase2");
   }
 
-  const auto local_stub_it = phase2_stub_shares_.find(self_id());
-  if (local_stub_it == phase2_stub_shares_.end()) {
-    throw std::logic_error("missing local phase2 stub share");
-  }
+  InitializePhase2InstancesIfNeeded();
 
-  local_delta_i_ = local_stub_it->second.delta_i;
-  local_sigma_i_ = local_stub_it->second.sigma_i;
-
-  local_phase2_ready_ = true;
-  phase2_received_shares_[self_id()] = local_stub_it->second;
-
-  Bytes payload;
-  payload.reserve(kScalarLen * 2);
-  AppendScalar(local_stub_it->second.delta_i, &payload);
-  AppendScalar(local_stub_it->second.sigma_i, &payload);
-
-  Envelope out;
-  out.session_id = session_id();
-  out.from = self_id();
-  out.to = kBroadcastPartyId;
-  out.type = MessageTypeForPhase(SignPhase::kPhase2);
-  out.payload = std::move(payload);
+  std::vector<Envelope> out;
+  out.swap(phase2_outbox_);
 
   MaybeAdvanceAfterPhase2();
   return out;
@@ -656,11 +730,14 @@ bool SignSession::HandleEnvelope(const Envelope& envelope) {
       }
       return HandlePhase1CommitEnvelope(envelope);
     case SignPhase::kPhase2:
-      if (envelope.type != MessageTypeForPhase(SignPhase::kPhase2)) {
-        Abort("unexpected envelope type for sign phase2");
-        return false;
+      if (envelope.type == MessageTypeForPhase(SignPhase::kPhase2)) {
+        return HandlePhase2InitEnvelope(envelope);
       }
-      return HandlePhase2StubEnvelope(envelope);
+      if (envelope.type == Phase2ResponseMessageType()) {
+        return HandlePhase2ResponseEnvelope(envelope);
+      }
+      Abort("unexpected envelope type for sign phase2");
+      return false;
     case SignPhase::kPhase3:
       if (envelope.type != MessageTypeForPhase(SignPhase::kPhase3)) {
         Abort("unexpected envelope type for sign phase3");
@@ -759,6 +836,10 @@ uint32_t SignSession::MessageTypeForPhase(SignPhase phase) {
   throw std::invalid_argument("invalid sign phase");
 }
 
+uint32_t SignSession::Phase2ResponseMessageType() {
+  return static_cast<uint32_t>(SignMessageType::kPhase2Response);
+}
+
 uint32_t SignSession::MessageTypeForPhase5Stage(SignPhase5Stage stage) {
   switch (stage) {
     case SignPhase5Stage::kPhase5A:
@@ -798,39 +879,166 @@ bool SignSession::HandlePhase1CommitEnvelope(const Envelope& envelope) {
   return true;
 }
 
-bool SignSession::HandlePhase2StubEnvelope(const Envelope& envelope) {
-  if (envelope.to != kBroadcastPartyId) {
-    Abort("sign phase2 stub message must be broadcast");
+bool SignSession::HandlePhase2InitEnvelope(const Envelope& envelope) {
+  if (envelope.to != self_id()) {
+    Abort("sign phase2 initiator message must target receiver directly");
     return false;
-  }
-
-  const bool inserted = seen_phase2_.insert(envelope.from).second;
-  if (!inserted) {
-    return true;
   }
 
   try {
     size_t offset = 0;
-    const Scalar delta_i = ReadScalar(envelope.payload, &offset);
-    const Scalar sigma_i = ReadScalar(envelope.payload, &offset);
+    const uint32_t raw_type = ReadU32Be(envelope.payload, &offset);
+    if (raw_type != static_cast<uint32_t>(MtaType::kTimesGamma) &&
+        raw_type != static_cast<uint32_t>(MtaType::kTimesW)) {
+      throw std::invalid_argument("unknown phase2 MtA type");
+    }
+    const MtaType mta_type = static_cast<MtaType>(raw_type);
+
+    const Bytes instance_id =
+        ReadSizedField(envelope.payload, &offset, kMtaInstanceIdLen, "phase2 mta instance id");
+    if (instance_id.size() != kMtaInstanceIdLen) {
+      throw std::invalid_argument("phase2 mta instance id has invalid length");
+    }
+    const mpz_class c1 =
+        ReadMpzField(envelope.payload, &offset, kMaxMpzEncodedLen, "phase2 mta ciphertext c1");
     if (offset != envelope.payload.size()) {
-      throw std::invalid_argument("sign phase2 payload has trailing bytes");
+      throw std::invalid_argument("sign phase2 init payload has trailing bytes");
     }
 
-    const auto expected_it = phase2_stub_shares_.find(envelope.from);
-    if (expected_it == phase2_stub_shares_.end()) {
-      throw std::invalid_argument("missing expected stub share for sender");
+    const auto sender_pk_it = all_paillier_public_.find(envelope.from);
+    if (sender_pk_it == all_paillier_public_.end()) {
+      throw std::invalid_argument("missing Paillier public key for initiator");
     }
-    if (delta_i != expected_it->second.delta_i || sigma_i != expected_it->second.sigma_i) {
-      throw std::invalid_argument("phase2 stub share mismatch for sender");
+    const mpz_class& n = sender_pk_it->second.n;
+    const mpz_class n2 = n * n;
+    if (c1 < 0 || c1 >= n2) {
+      throw std::invalid_argument("phase2 c1 is out of range");
     }
 
-    phase2_received_shares_[envelope.from] = SignPhase2StubShare{.delta_i = delta_i, .sigma_i = sigma_i};
+    const std::string request_key = MakeResponderRequestKey(envelope.from, static_cast<uint8_t>(raw_type));
+    const std::string instance_key = BytesToKey(instance_id);
+    const auto seen_request_it = phase2_responder_requests_seen_.find(request_key);
+    if (seen_request_it != phase2_responder_requests_seen_.end()) {
+      if (seen_request_it->second != instance_key) {
+        throw std::invalid_argument("phase2 request instance mismatch for sender/type");
+      }
+      return true;
+    }
+
+    const Scalar witness =
+        (mta_type == MtaType::kTimesGamma) ? local_gamma_i_ : local_w_i_;
+    const mpz_class y = RandomBelow(Scalar::ModulusQ());
+    const mpz_class r_b = SampleZnStar(n);
+    const mpz_class gamma = n + 1;
+
+    mpz_class c1_pow_x;
+    mpz_powm(c1_pow_x.get_mpz_t(), c1.get_mpz_t(), witness.value().get_mpz_t(), n2.get_mpz_t());
+
+    mpz_class gamma_pow_y;
+    mpz_powm(gamma_pow_y.get_mpz_t(), gamma.get_mpz_t(), y.get_mpz_t(), n2.get_mpz_t());
+
+    mpz_class r_pow_n;
+    mpz_powm(r_pow_n.get_mpz_t(), r_b.get_mpz_t(), n.get_mpz_t(), n2.get_mpz_t());
+
+    mpz_class c2 = ModN2Normalize(c1_pow_x * gamma_pow_y, n2);
+    c2 = ModN2Normalize(c2 * r_pow_n, n2);
+
+    const Scalar responder_share(NormalizeModQ(-y));
+    if (mta_type == MtaType::kTimesGamma) {
+      phase2_mta_responder_sum_ = phase2_mta_responder_sum_ + responder_share;
+    } else {
+      phase2_mtawc_responder_sum_ = phase2_mtawc_responder_sum_ + responder_share;
+    }
+    phase2_responder_requests_seen_.emplace(request_key, instance_key);
+
+    Bytes payload;
+    AppendU32Be(raw_type, &payload);
+    AppendSizedField(instance_id, &payload);
+    AppendMpzField(c2, &payload);
+
+    Envelope out;
+    out.session_id = session_id();
+    out.from = self_id();
+    out.to = envelope.from;
+    out.type = Phase2ResponseMessageType();
+    out.payload = std::move(payload);
+    phase2_outbox_.push_back(std::move(out));
   } catch (const std::exception& ex) {
-    Abort(std::string("invalid sign phase2 payload: ") + ex.what());
+    Abort(std::string("invalid sign phase2 initiator payload: ") + ex.what());
     return false;
   }
 
+  seen_phase2_.insert(envelope.from);
+  Touch();
+  MaybeAdvanceAfterPhase2();
+  return true;
+}
+
+bool SignSession::HandlePhase2ResponseEnvelope(const Envelope& envelope) {
+  if (envelope.to != self_id()) {
+    Abort("sign phase2 response message must target receiver directly");
+    return false;
+  }
+
+  try {
+    size_t offset = 0;
+    const uint32_t raw_type = ReadU32Be(envelope.payload, &offset);
+    if (raw_type != static_cast<uint32_t>(MtaType::kTimesGamma) &&
+        raw_type != static_cast<uint32_t>(MtaType::kTimesW)) {
+      throw std::invalid_argument("unknown phase2 response MtA type");
+    }
+    const MtaType mta_type = static_cast<MtaType>(raw_type);
+
+    const Bytes instance_id =
+        ReadSizedField(envelope.payload, &offset, kMtaInstanceIdLen, "phase2 mta instance id");
+    if (instance_id.size() != kMtaInstanceIdLen) {
+      throw std::invalid_argument("phase2 response instance id has invalid length");
+    }
+    const mpz_class c2 =
+        ReadMpzField(envelope.payload, &offset, kMaxMpzEncodedLen, "phase2 mta ciphertext c2");
+    if (offset != envelope.payload.size()) {
+      throw std::invalid_argument("sign phase2 response payload has trailing bytes");
+    }
+
+    const std::string instance_key = BytesToKey(instance_id);
+    const auto instance_it = phase2_initiator_instances_.find(instance_key);
+    if (instance_it == phase2_initiator_instances_.end()) {
+      throw std::invalid_argument("unknown phase2 response instance id");
+    }
+    Phase2InitiatorInstance& instance = instance_it->second;
+    if (instance.responder != envelope.from) {
+      throw std::invalid_argument("phase2 response sender mismatch");
+    }
+    if (instance.type != mta_type) {
+      throw std::invalid_argument("phase2 response type mismatch");
+    }
+    if (instance.response_received) {
+      return true;
+    }
+
+    const auto self_pk_it = all_paillier_public_.find(self_id());
+    if (self_pk_it == all_paillier_public_.end()) {
+      throw std::invalid_argument("missing self Paillier public key");
+    }
+    const mpz_class n2 = self_pk_it->second.n * self_pk_it->second.n;
+    if (c2 < 0 || c2 >= n2) {
+      throw std::invalid_argument("phase2 c2 is out of range");
+    }
+
+    const mpz_class decrypted = local_paillier_->Decrypt(c2);
+    const Scalar initiator_share(NormalizeModQ(decrypted));
+    if (mta_type == MtaType::kTimesGamma) {
+      phase2_mta_initiator_sum_ = phase2_mta_initiator_sum_ + initiator_share;
+    } else {
+      phase2_mtawc_initiator_sum_ = phase2_mtawc_initiator_sum_ + initiator_share;
+    }
+    instance.response_received = true;
+  } catch (const std::exception& ex) {
+    Abort(std::string("invalid sign phase2 response payload: ") + ex.what());
+    return false;
+  }
+
+  seen_phase2_.insert(envelope.from);
   Touch();
   MaybeAdvanceAfterPhase2();
   return true;
@@ -852,14 +1060,6 @@ bool SignSession::HandlePhase3DeltaEnvelope(const Envelope& envelope) {
     const Scalar delta_i = ReadScalar(envelope.payload, &offset);
     if (offset != envelope.payload.size()) {
       throw std::invalid_argument("sign phase3 payload has trailing bytes");
-    }
-
-    const auto phase2_it = phase2_received_shares_.find(envelope.from);
-    if (phase2_it == phase2_received_shares_.end()) {
-      throw std::invalid_argument("sign phase3 received before phase2 share for sender");
-    }
-    if (delta_i != phase2_it->second.delta_i) {
-      throw std::invalid_argument("sign phase3 delta mismatch with phase2 stub share");
     }
 
     phase3_delta_shares_[envelope.from] = delta_i;
@@ -1125,6 +1325,91 @@ void SignSession::PreparePhase1SecretsIfNeeded() {
   local_phase1_commitment_ = commitment.commitment;
 }
 
+void SignSession::InitializePhase2InstancesIfNeeded() {
+  if (phase2_instances_initialized_) {
+    return;
+  }
+  if (phase_ != SignPhase::kPhase2) {
+    throw std::logic_error("phase2 instances can only be initialized in sign phase2");
+  }
+
+  PreparePhase1SecretsIfNeeded();
+  phase2_instances_initialized_ = true;
+
+  for (PartyIndex peer : participants_) {
+    if (peer == self_id()) {
+      continue;
+    }
+
+    for (MtaType type : {MtaType::kTimesGamma, MtaType::kTimesW}) {
+      Bytes instance_id = RandomMtaInstanceId();
+      std::string instance_key = BytesToKey(instance_id);
+      while (phase2_initiator_instances_.contains(instance_key)) {
+        instance_id = RandomMtaInstanceId();
+        instance_key = BytesToKey(instance_id);
+      }
+
+      const mpz_class c1 = local_paillier_->Encrypt(local_k_i_.value());
+      phase2_initiator_instances_.emplace(
+          instance_key,
+          Phase2InitiatorInstance{
+              .responder = peer,
+              .type = type,
+              .instance_id = instance_id,
+              .c1 = c1,
+              .response_received = false,
+          });
+
+      Bytes payload;
+      AppendU32Be(static_cast<uint32_t>(type), &payload);
+      AppendSizedField(instance_id, &payload);
+      AppendMpzField(c1, &payload);
+
+      Envelope out;
+      out.session_id = session_id();
+      out.from = self_id();
+      out.to = peer;
+      out.type = MessageTypeForPhase(SignPhase::kPhase2);
+      out.payload = std::move(payload);
+      phase2_outbox_.push_back(std::move(out));
+    }
+  }
+}
+
+void SignSession::MaybeFinalizePhase2AndAdvance() {
+  if (phase_ != SignPhase::kPhase2 || local_phase2_ready_) {
+    return;
+  }
+  if (!phase2_instances_initialized_) {
+    return;
+  }
+  if (!phase2_outbox_.empty()) {
+    return;
+  }
+
+  const size_t expected_instance_count = peers_.size() * 2;
+  if (phase2_initiator_instances_.size() != expected_instance_count) {
+    return;
+  }
+  if (phase2_responder_requests_seen_.size() != expected_instance_count) {
+    return;
+  }
+
+  for (const auto& [instance_key, instance] : phase2_initiator_instances_) {
+    (void)instance_key;
+    if (!instance.response_received) {
+      return;
+    }
+  }
+
+  local_delta_i_ =
+      (local_k_i_ * local_gamma_i_) + phase2_mta_initiator_sum_ + phase2_mta_responder_sum_;
+  local_sigma_i_ =
+      (local_k_i_ * local_w_i_) + phase2_mtawc_initiator_sum_ + phase2_mtawc_responder_sum_;
+
+  local_phase2_ready_ = true;
+}
+
 void SignSession::ComputeDeltaInverseAndAdvanceToPhase4() {
   Scalar delta;
   for (PartyIndex party : participants_) {
@@ -1309,13 +1594,8 @@ void SignSession::MaybeAdvanceAfterPhase2() {
   if (phase_ != SignPhase::kPhase2) {
     return;
   }
+  MaybeFinalizePhase2AndAdvance();
   if (!local_phase2_ready_) {
-    return;
-  }
-  if (seen_phase2_.size() != peers_.size()) {
-    return;
-  }
-  if (phase2_received_shares_.size() != participants_.size()) {
     return;
   }
   phase_ = SignPhase::kPhase3;
