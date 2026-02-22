@@ -64,7 +64,11 @@ target_link_libraries(m2_tests PRIVATE tecdsa_m0)
 add_executable(m3_tests tests/m3_tests.cpp)
 target_link_libraries(m3_tests PRIVATE tecdsa_m0)
 
+add_executable(m4_tests tests/m4_tests.cpp)
+target_link_libraries(m4_tests PRIVATE tecdsa_m0)
+
 enable_testing()
 add_test(NAME m0_tests COMMAND m0_tests)
 add_test(NAME m2_tests COMMAND m2_tests)
 add_test(NAME m3_tests COMMAND m3_tests)
+add_test(NAME m4_tests COMMAND m4_tests)

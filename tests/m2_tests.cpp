@@ -2,6 +2,7 @@
 #include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "tecdsa/net/in_memory_transport.hpp"
@@ -20,8 +21,11 @@ using tecdsa::KeygenSessionConfig;
 using tecdsa::SessionRouter;
 using tecdsa::SessionStatus;
 using tecdsa::SignPhase;
+using tecdsa::SignPhase2StubShare;
+using tecdsa::SignPhase5Stage;
 using tecdsa::SignSession;
 using tecdsa::SignSessionConfig;
+using tecdsa::Scalar;
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -144,32 +148,134 @@ void TestKeygenSessionSkeleton() {
 }
 
 void TestSignSessionSkeletonAndTimeout() {
-  SignSessionConfig cfg;
-  cfg.session_id = {2, 2, 2};
-  cfg.self_id = 1;
-  cfg.participants = {1, 2, 3};
-  cfg.timeout = std::chrono::seconds(5);
+  const std::vector<tecdsa::PartyIndex> participants = {1, 2};
 
-  SignSession session(std::move(cfg));
+  std::unordered_map<tecdsa::PartyIndex, tecdsa::ECPoint> all_x_i;
+  all_x_i.emplace(1, tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(3)));
+  all_x_i.emplace(2, tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(5)));
+  const tecdsa::ECPoint y = tecdsa::ECPoint::GeneratorMultiply(Scalar::FromUint64(1));
 
-  for (SignPhase phase :
-       {SignPhase::kPhase1, SignPhase::kPhase2, SignPhase::kPhase3, SignPhase::kPhase4, SignPhase::kPhase5}) {
-    const uint32_t type = SignSession::MessageTypeForPhase(phase);
-    Expect(session.phase() == phase, "Sign phase should match expected progression");
-    Expect(session.HandleEnvelope(MakeEnvelope({2, 2, 2}, type, 2)),
-           "Sign should accept message from peer2");
-    Expect(session.HandleEnvelope(MakeEnvelope({2, 2, 2}, type, 3)),
-           "Sign should accept message from peer3");
+  std::unordered_map<tecdsa::PartyIndex, SignPhase2StubShare> phase2_stub;
+  phase2_stub.emplace(1, SignPhase2StubShare{.delta_i = Scalar::FromUint64(506),
+                                              .sigma_i = Scalar::FromUint64(11)});
+  phase2_stub.emplace(2, SignPhase2StubShare{.delta_i = Scalar::FromUint64(552),
+                                              .sigma_i = Scalar::FromUint64(12)});
+
+  auto build_cfg = [&](tecdsa::PartyIndex self_id,
+                       uint64_t x_i_value,
+                       uint64_t fixed_k,
+                       uint64_t fixed_gamma,
+                       const Bytes& session_id,
+                       std::chrono::milliseconds timeout) {
+    SignSessionConfig cfg;
+    cfg.session_id = session_id;
+    cfg.self_id = self_id;
+    cfg.participants = participants;
+    cfg.timeout = timeout;
+    cfg.x_i = Scalar::FromUint64(x_i_value);
+    cfg.y = y;
+    cfg.all_X_i = all_x_i;
+    cfg.msg32 = Bytes{
+        0x4d, 0x32, 0x2d, 0x73, 0x69, 0x67, 0x6e, 0x2d,
+        0x73, 0x6b, 0x65, 0x6c, 0x65, 0x74, 0x6f, 0x6e,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+    };
+    cfg.phase2_stub_shares = phase2_stub;
+    cfg.fixed_k_i = Scalar::FromUint64(fixed_k);
+    cfg.fixed_gamma_i = Scalar::FromUint64(fixed_gamma);
+    return cfg;
+  };
+
+  SignSession session1(build_cfg(/*self_id=*/1,
+                                 /*x_i_value=*/3,
+                                 /*fixed_k=*/11,
+                                 /*fixed_gamma=*/22,
+                                 Bytes{2, 2, 2},
+                                 std::chrono::seconds(5)));
+  SignSession session2(build_cfg(/*self_id=*/2,
+                                 /*x_i_value=*/5,
+                                 /*fixed_k=*/12,
+                                 /*fixed_gamma=*/24,
+                                 Bytes{2, 2, 2},
+                                 std::chrono::seconds(5)));
+
+  auto deliver_between_two = [&](const Envelope& envelope) {
+    if (envelope.from == 1) {
+      return session2.HandleEnvelope(envelope);
+    }
+    if (envelope.from == 2) {
+      return session1.HandleEnvelope(envelope);
+    }
+    return false;
+  };
+
+  auto deliver_stage = [&](const Envelope& from1, const Envelope& from2, const std::string& stage_name) {
+    Expect(deliver_between_two(from1), stage_name + ": peer2 should accept party1 message");
+    Expect(deliver_between_two(from2), stage_name + ": peer1 should accept party2 message");
+  };
+
+  deliver_stage(session1.BuildPhase1CommitEnvelope(), session2.BuildPhase1CommitEnvelope(), "phase1");
+  Expect(session1.phase() == SignPhase::kPhase2 && session2.phase() == SignPhase::kPhase2,
+         "Sign sessions should enter phase2");
+
+  deliver_stage(session1.BuildPhase2StubEnvelope(), session2.BuildPhase2StubEnvelope(), "phase2");
+  Expect(session1.phase() == SignPhase::kPhase3 && session2.phase() == SignPhase::kPhase3,
+         "Sign sessions should enter phase3");
+
+  deliver_stage(session1.BuildPhase3DeltaEnvelope(), session2.BuildPhase3DeltaEnvelope(), "phase3");
+  Expect(session1.phase() == SignPhase::kPhase4 && session2.phase() == SignPhase::kPhase4,
+         "Sign sessions should enter phase4");
+
+  deliver_stage(session1.BuildPhase4OpenGammaEnvelope(), session2.BuildPhase4OpenGammaEnvelope(), "phase4");
+  Expect(session1.phase() == SignPhase::kPhase5 && session2.phase() == SignPhase::kPhase5,
+         "Sign sessions should enter phase5");
+  Expect(session1.phase5_stage() == SignPhase5Stage::kPhase5A &&
+             session2.phase5_stage() == SignPhase5Stage::kPhase5A,
+         "Sign sessions should start at phase5A");
+
+  deliver_stage(session1.BuildPhase5ACommitEnvelope(), session2.BuildPhase5ACommitEnvelope(), "phase5A");
+  Expect(session1.phase5_stage() == SignPhase5Stage::kPhase5B &&
+             session2.phase5_stage() == SignPhase5Stage::kPhase5B,
+         "Sign sessions should advance to phase5B");
+
+  deliver_stage(session1.BuildPhase5BOpenEnvelope(), session2.BuildPhase5BOpenEnvelope(), "phase5B");
+  Expect(session1.phase5_stage() == SignPhase5Stage::kPhase5C &&
+             session2.phase5_stage() == SignPhase5Stage::kPhase5C,
+         "Sign sessions should advance to phase5C");
+
+  deliver_stage(session1.BuildPhase5CCommitEnvelope(), session2.BuildPhase5CCommitEnvelope(), "phase5C");
+  Expect(session1.phase5_stage() == SignPhase5Stage::kPhase5D &&
+             session2.phase5_stage() == SignPhase5Stage::kPhase5D,
+         "Sign sessions should advance to phase5D");
+
+  deliver_stage(session1.BuildPhase5DOpenEnvelope(), session2.BuildPhase5DOpenEnvelope(), "phase5D");
+  Expect(session1.phase5_stage() == SignPhase5Stage::kPhase5E &&
+             session2.phase5_stage() == SignPhase5Stage::kPhase5E,
+         "Sign sessions should advance to phase5E");
+
+  deliver_stage(session1.BuildPhase5ERevealEnvelope(), session2.BuildPhase5ERevealEnvelope(), "phase5E");
+  if (!(session1.status() == SessionStatus::kCompleted &&
+        session2.status() == SessionStatus::kCompleted)) {
+    throw std::runtime_error(
+        "Sign sessions should complete after phase5E (status1=" +
+        std::to_string(static_cast<int>(session1.status())) +
+        ", status2=" + std::to_string(static_cast<int>(session2.status())) +
+        ", abort1='" + session1.abort_reason() +
+        "', abort2='" + session2.abort_reason() + "')");
   }
-
-  Expect(session.status() == SessionStatus::kCompleted,
-         "Sign skeleton should complete after phase5");
+  Expect(session1.HasResult() && session2.HasResult(),
+         "Completed sessions should expose sign results");
+  Expect(session1.result().r == session2.result().r && session1.result().s == session2.result().s,
+         "Completed sign sessions should agree on signature");
 
   SignSessionConfig timeout_cfg;
-  timeout_cfg.session_id = {3, 3, 3};
-  timeout_cfg.self_id = 1;
-  timeout_cfg.participants = {1, 2};
-  timeout_cfg.timeout = std::chrono::milliseconds(1);
+  timeout_cfg = build_cfg(/*self_id=*/1,
+                          /*x_i_value=*/3,
+                          /*fixed_k=*/11,
+                          /*fixed_gamma=*/22,
+                          Bytes{3, 3, 3},
+                          std::chrono::milliseconds(1));
 
   SignSession timeout_session(std::move(timeout_cfg));
   const auto far_future = std::chrono::steady_clock::now() + std::chrono::seconds(1);
