@@ -32,6 +32,7 @@
   - 篡改消息触发中止
 - `m4_tests`：Sign 完整流程与故障路径
   - 端到端生成并验证 `(r,s)`
+  - Phase2 附录 A 证明（A.1/A.2/A.3）校验
   - Phase5D 篡改导致失败
   - Phase2 instance id 不一致触发中止
   - Phase4/Phase5B 的 ZK proof 篡改触发中止
@@ -48,7 +49,7 @@
 ### Sign（`SignSession`）
 
 1. Phase1：提交 `Gamma_i` 承诺  
-2. Phase2：双向 MtA / MtAwc 交互，得到 `delta_i`、`sigma_i` 相关份额  
+2. Phase2：双向 MtA / MtAwc + 附录A证明（A.1/A.2/A.3）交互，得到 `delta_i`、`sigma_i` 相关份额  
 3. Phase3：广播 `delta_i` 并聚合求逆  
 4. Phase4：打开 `Gamma_i` + Schnorr 证明，计算 `R` 与 `r`  
 5. Phase5A~5E：两轮承诺-打开（含 `A_i` Schnorr 与 `V_i=R^{s_i}g^{l_i}` 关系证明）与 `s_i` 揭示，最终聚合并本地验证 ECDSA 签名

@@ -48,6 +48,12 @@ enum class SignMessageType : uint32_t {
 };
 
 struct SignSessionConfig {
+  struct AuxRsaParams {
+    mpz_class n_tilde;
+    mpz_class h1;
+    mpz_class h2;
+  };
+
   Bytes session_id;
   PartyIndex self_id = 0;
   std::vector<PartyIndex> participants;
@@ -57,6 +63,7 @@ struct SignSessionConfig {
   ECPoint y;
   std::unordered_map<PartyIndex, ECPoint> all_X_i;
   std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public;
+  std::unordered_map<PartyIndex, AuxRsaParams> all_aux_rsa_params;
   std::shared_ptr<PaillierProvider> local_paillier;
   Bytes msg32;
 
@@ -125,6 +132,7 @@ class SignSession : public Session {
     MtaType type = MtaType::kTimesGamma;
     Bytes instance_id;
     mpz_class c1;
+    mpz_class c1_randomness;
     bool response_received = false;
   };
 
@@ -195,6 +203,7 @@ class SignSession : public Session {
   std::unordered_set<PartyIndex> peers_;
   std::unordered_map<PartyIndex, ECPoint> all_X_i_;
   std::unordered_map<PartyIndex, PaillierPublicKey> all_paillier_public_;
+  std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> all_aux_rsa_params_;
   std::shared_ptr<PaillierProvider> local_paillier_;
 
   Scalar local_x_i_;

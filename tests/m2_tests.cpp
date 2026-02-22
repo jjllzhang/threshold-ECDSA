@@ -28,6 +28,51 @@ using tecdsa::SignSession;
 using tecdsa::SignSessionConfig;
 using tecdsa::Scalar;
 
+std::unordered_map<tecdsa::PartyIndex, SignSessionConfig::AuxRsaParams> BuildAuxParamsFromPaillier(
+    const std::vector<tecdsa::PartyIndex>& participants,
+    const std::unordered_map<tecdsa::PartyIndex, PaillierPublicKey>& paillier_public) {
+  std::unordered_map<tecdsa::PartyIndex, SignSessionConfig::AuxRsaParams> out;
+  out.reserve(participants.size());
+
+  auto pick_coprime = [](const mpz_class& modulus, const mpz_class& seed) {
+    mpz_class value = seed % modulus;
+    if (value < 2) {
+      value = 2;
+    }
+    while (true) {
+      if (value >= modulus) {
+        value = 2;
+      }
+      mpz_class gcd;
+      mpz_gcd(gcd.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t());
+      if (gcd == 1) {
+        return value;
+      }
+      ++value;
+    }
+  };
+
+  for (tecdsa::PartyIndex party : participants) {
+    const auto pub_it = paillier_public.find(party);
+    if (pub_it == paillier_public.end()) {
+      throw std::runtime_error("missing Paillier public key while building aux params");
+    }
+    const mpz_class n_tilde = pub_it->second.n;
+    const mpz_class h1 = pick_coprime(n_tilde, mpz_class(2 + 2 * party));
+    mpz_class h2 = pick_coprime(n_tilde, mpz_class(3 + 2 * party));
+    if (h2 == h1) {
+      h2 = pick_coprime(n_tilde, h1 + 1);
+    }
+    out.emplace(party, SignSessionConfig::AuxRsaParams{
+                          .n_tilde = n_tilde,
+                          .h1 = h1,
+                          .h2 = h2,
+                      });
+  }
+
+  return out;
+}
+
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error("Test failed: " + message);
@@ -162,6 +207,7 @@ void TestSignSessionSkeletonAndTimeout() {
   std::unordered_map<tecdsa::PartyIndex, PaillierPublicKey> paillier_public;
   paillier_public.emplace(1, PaillierPublicKey{.n = paillier_1->modulus_n()});
   paillier_public.emplace(2, PaillierPublicKey{.n = paillier_2->modulus_n()});
+  const auto aux_params = BuildAuxParamsFromPaillier(participants, paillier_public);
 
   auto build_cfg = [&](tecdsa::PartyIndex self_id,
                        uint64_t x_i_value,
@@ -179,6 +225,7 @@ void TestSignSessionSkeletonAndTimeout() {
     cfg.y = y;
     cfg.all_X_i = all_x_i;
     cfg.all_paillier_public = paillier_public;
+    cfg.all_aux_rsa_params = aux_params;
     cfg.local_paillier = std::move(local_paillier);
     cfg.msg32 = Bytes{
         0x4d, 0x32, 0x2d, 0x73, 0x69, 0x67, 0x6e, 0x2d,

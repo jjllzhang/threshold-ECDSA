@@ -35,6 +35,55 @@ constexpr char kPhase5ACommitDomain[] = "GG2019/sign/phase5A";
 constexpr char kPhase5CCommitDomain[] = "GG2019/sign/phase5C";
 constexpr char kSchnorrProofId[] = "GG2019/Schnorr/v1";
 constexpr char kVRelationProofId[] = "GG2019/VRel/v1";
+constexpr char kA1RangeProofId[] = "GG2019/A1Range/v1";
+constexpr char kA2MtAwcProofId[] = "GG2019/A2MtAwc/v1";
+constexpr char kA3MtAProofId[] = "GG2019/A3MtA/v1";
+constexpr char kCurveName[] = "secp256k1";
+
+using AuxRsaParams = SignSessionConfig::AuxRsaParams;
+
+struct MtaProofContext {
+  Bytes session_id;
+  PartyIndex initiator_id = 0;
+  PartyIndex responder_id = 0;
+  Bytes mta_instance_id;
+};
+
+struct A1RangeProof {
+  mpz_class z;
+  mpz_class u;
+  mpz_class w;
+  mpz_class s;
+  mpz_class s1;
+  mpz_class s2;
+};
+
+struct A2MtAwcProof {
+  ECPoint u;
+  mpz_class z;
+  mpz_class z2;
+  mpz_class t;
+  mpz_class v;
+  mpz_class w;
+  mpz_class s;
+  mpz_class s1;
+  mpz_class s2;
+  mpz_class t1;
+  mpz_class t2;
+};
+
+struct A3MtAProof {
+  mpz_class z;
+  mpz_class z2;
+  mpz_class t;
+  mpz_class v;
+  mpz_class w;
+  mpz_class s;
+  mpz_class s1;
+  mpz_class s2;
+  mpz_class t1;
+  mpz_class t2;
+};
 
 void ValidateParticipantsOrThrow(const std::vector<PartyIndex>& participants, PartyIndex self_id) {
   if (participants.size() < 2) {
@@ -216,6 +265,629 @@ mpz_class SampleZnStar(const mpz_class& modulus_n) {
   } while (candidate == 0 || gcd != 1);
 
   return candidate;
+}
+
+bool IsZnStarElement(const mpz_class& value, const mpz_class& modulus) {
+  if (value <= 0 || value >= modulus) {
+    return false;
+  }
+  mpz_class gcd;
+  mpz_gcd(gcd.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t());
+  return gcd == 1;
+}
+
+void ValidateAuxRsaParamsOrThrow(const AuxRsaParams& params) {
+  if (params.n_tilde <= 2) {
+    throw std::invalid_argument("aux RSA Ntilde must be > 2");
+  }
+  if (!IsZnStarElement(params.h1, params.n_tilde)) {
+    throw std::invalid_argument("aux RSA h1 must be in Z*_Ntilde");
+  }
+  if (!IsZnStarElement(params.h2, params.n_tilde)) {
+    throw std::invalid_argument("aux RSA h2 must be in Z*_Ntilde");
+  }
+}
+
+const mpz_class& QPow3() {
+  static const mpz_class q_pow_3 = []() {
+    mpz_class out;
+    mpz_pow_ui(out.get_mpz_t(), Scalar::ModulusQ().get_mpz_t(), 3);
+    return out;
+  }();
+  return q_pow_3;
+}
+
+const mpz_class& QPow7() {
+  static const mpz_class q_pow_7 = []() {
+    mpz_class out;
+    mpz_pow_ui(out.get_mpz_t(), Scalar::ModulusQ().get_mpz_t(), 7);
+    return out;
+  }();
+  return q_pow_7;
+}
+
+mpz_class NormalizeMod(const mpz_class& value, const mpz_class& modulus) {
+  mpz_class out = value % modulus;
+  if (out < 0) {
+    out += modulus;
+  }
+  return out;
+}
+
+mpz_class MulMod(const mpz_class& lhs, const mpz_class& rhs, const mpz_class& modulus) {
+  return NormalizeMod(lhs * rhs, modulus);
+}
+
+mpz_class PowMod(const mpz_class& base, const mpz_class& exp, const mpz_class& modulus) {
+  if (exp < 0) {
+    throw std::invalid_argument("modular exponent must be non-negative");
+  }
+  mpz_class out;
+  mpz_powm(out.get_mpz_t(), base.get_mpz_t(), exp.get_mpz_t(), modulus.get_mpz_t());
+  return out;
+}
+
+std::optional<mpz_class> InvertMod(const mpz_class& value, const mpz_class& modulus) {
+  mpz_class inverse;
+  if (mpz_invert(inverse.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t()) == 0) {
+    return std::nullopt;
+  }
+  return inverse;
+}
+
+bool IsInRange(const mpz_class& value, const mpz_class& modulus) {
+  return value >= 0 && value < modulus;
+}
+
+Bytes ExportFixedWidth(const mpz_class& value, size_t width) {
+  if (value < 0) {
+    throw std::invalid_argument("cannot export negative integer to fixed width");
+  }
+
+  Bytes out(width, 0);
+  if (value == 0) {
+    return out;
+  }
+
+  Bytes encoded((mpz_sizeinbase(value.get_mpz_t(), 2) + 7) / 8);
+  size_t count = 0;
+  mpz_export(encoded.data(), &count, 1, sizeof(uint8_t), 1, 0, value.get_mpz_t());
+  encoded.resize(count);
+  if (encoded.size() > width) {
+    throw std::invalid_argument("integer does not fit fixed-width buffer");
+  }
+  std::copy(encoded.begin(), encoded.end(), out.begin() + static_cast<std::ptrdiff_t>(width - encoded.size()));
+  return out;
+}
+
+const Bytes& CurveNameBytes() {
+  static const Bytes kCurveBytes(
+      reinterpret_cast<const uint8_t*>(kCurveName),
+      reinterpret_cast<const uint8_t*>(kCurveName) + std::strlen(kCurveName));
+  return kCurveBytes;
+}
+
+const Bytes& ModulusQBytes() {
+  static const Bytes kQBytes = ExportFixedWidth(Scalar::ModulusQ(), 32);
+  return kQBytes;
+}
+
+void AppendCommonMtaTranscriptFields(Transcript* transcript,
+                                     const char* proof_id,
+                                     const MtaProofContext& ctx) {
+  const std::span<const uint8_t> proof_id_view(
+      reinterpret_cast<const uint8_t*>(proof_id), std::strlen(proof_id));
+  transcript->append("proof_id", proof_id_view);
+  transcript->append("session_id", ctx.session_id);
+  transcript->append("initiator", PartyIdToBytes(ctx.initiator_id));
+  transcript->append("responder", PartyIdToBytes(ctx.responder_id));
+  transcript->append("mta_id", ctx.mta_instance_id);
+  transcript->append("curve", CurveNameBytes());
+  transcript->append("q", ModulusQBytes());
+}
+
+Scalar BuildA1RangeChallenge(const MtaProofContext& ctx,
+                             const mpz_class& n,
+                             const mpz_class& gamma,
+                             const AuxRsaParams& aux,
+                             const mpz_class& c,
+                             const mpz_class& z,
+                             const mpz_class& u,
+                             const mpz_class& w) {
+  Transcript transcript;
+  AppendCommonMtaTranscriptFields(&transcript, kA1RangeProofId, ctx);
+  transcript.append("N", EncodeMpz(n));
+  transcript.append("Gamma", EncodeMpz(gamma));
+  transcript.append("Ntilde", EncodeMpz(aux.n_tilde));
+  transcript.append("h1", EncodeMpz(aux.h1));
+  transcript.append("h2", EncodeMpz(aux.h2));
+  transcript.append("c", EncodeMpz(c));
+  transcript.append("z", EncodeMpz(z));
+  transcript.append("u", EncodeMpz(u));
+  transcript.append("w", EncodeMpz(w));
+  return transcript.challenge_scalar_mod_q();
+}
+
+Scalar BuildA2MtAwcChallenge(const MtaProofContext& ctx,
+                             const mpz_class& n,
+                             const mpz_class& gamma,
+                             const AuxRsaParams& aux,
+                             const mpz_class& c1,
+                             const mpz_class& c2,
+                             const ECPoint& statement_x,
+                             const A2MtAwcProof& proof) {
+  Transcript transcript;
+  AppendCommonMtaTranscriptFields(&transcript, kA2MtAwcProofId, ctx);
+  transcript.append("N", EncodeMpz(n));
+  transcript.append("Gamma", EncodeMpz(gamma));
+  transcript.append("Ntilde", EncodeMpz(aux.n_tilde));
+  transcript.append("h1", EncodeMpz(aux.h1));
+  transcript.append("h2", EncodeMpz(aux.h2));
+  transcript.append("c1", EncodeMpz(c1));
+  transcript.append("c2", EncodeMpz(c2));
+  transcript.append("X", EncodePoint(statement_x));
+  transcript.append("u", EncodePoint(proof.u));
+  transcript.append("z", EncodeMpz(proof.z));
+  transcript.append("z2", EncodeMpz(proof.z2));
+  transcript.append("t", EncodeMpz(proof.t));
+  transcript.append("v", EncodeMpz(proof.v));
+  transcript.append("w", EncodeMpz(proof.w));
+  return transcript.challenge_scalar_mod_q();
+}
+
+Scalar BuildA3MtAChallenge(const MtaProofContext& ctx,
+                           const mpz_class& n,
+                           const mpz_class& gamma,
+                           const AuxRsaParams& aux,
+                           const mpz_class& c1,
+                           const mpz_class& c2,
+                           const A3MtAProof& proof) {
+  Transcript transcript;
+  AppendCommonMtaTranscriptFields(&transcript, kA3MtAProofId, ctx);
+  transcript.append("N", EncodeMpz(n));
+  transcript.append("Gamma", EncodeMpz(gamma));
+  transcript.append("Ntilde", EncodeMpz(aux.n_tilde));
+  transcript.append("h1", EncodeMpz(aux.h1));
+  transcript.append("h2", EncodeMpz(aux.h2));
+  transcript.append("c1", EncodeMpz(c1));
+  transcript.append("c2", EncodeMpz(c2));
+  transcript.append("z", EncodeMpz(proof.z));
+  transcript.append("z2", EncodeMpz(proof.z2));
+  transcript.append("t", EncodeMpz(proof.t));
+  transcript.append("v", EncodeMpz(proof.v));
+  transcript.append("w", EncodeMpz(proof.w));
+  return transcript.challenge_scalar_mod_q();
+}
+
+A1RangeProof ProveA1Range(const MtaProofContext& ctx,
+                          const mpz_class& n,
+                          const AuxRsaParams& verifier_aux,
+                          const mpz_class& c,
+                          const mpz_class& witness_m,
+                          const mpz_class& witness_r) {
+  const mpz_class n2 = n * n;
+  const mpz_class gamma = n + 1;
+  const mpz_class q_mul_n_tilde = Scalar::ModulusQ() * verifier_aux.n_tilde;
+  const mpz_class q3_mul_n_tilde = QPow3() * verifier_aux.n_tilde;
+
+  while (true) {
+    const mpz_class alpha = RandomBelow(QPow3());
+    const mpz_class beta = SampleZnStar(n);
+    const mpz_class gamma_rand = RandomBelow(q3_mul_n_tilde);
+    const mpz_class rho = RandomBelow(q_mul_n_tilde);
+
+    const mpz_class z =
+        MulMod(PowMod(verifier_aux.h1, witness_m, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, rho, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+    const mpz_class u =
+        MulMod(PowMod(gamma, alpha, n2),
+               PowMod(beta, n, n2),
+               n2);
+    const mpz_class w =
+        MulMod(PowMod(verifier_aux.h1, alpha, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, gamma_rand, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+
+    const Scalar e_scalar = BuildA1RangeChallenge(ctx, n, gamma, verifier_aux, c, z, u, w);
+    const mpz_class& e = e_scalar.value();
+    const mpz_class s = MulMod(PowMod(witness_r, e, n), beta, n);
+    const mpz_class s1 = (e * witness_m) + alpha;
+    const mpz_class s2 = (e * rho) + gamma_rand;
+    if (s1 > QPow3()) {
+      continue;
+    }
+
+    return A1RangeProof{
+        .z = z,
+        .u = u,
+        .w = w,
+        .s = s,
+        .s1 = s1,
+        .s2 = s2,
+    };
+  }
+}
+
+bool VerifyA1Range(const MtaProofContext& ctx,
+                   const mpz_class& n,
+                   const AuxRsaParams& verifier_aux,
+                   const mpz_class& c,
+                   const A1RangeProof& proof) {
+  const mpz_class n2 = n * n;
+  const mpz_class gamma = n + 1;
+
+  if (!IsInRange(c, n2) || !IsInRange(proof.u, n2) ||
+      !IsInRange(proof.z, verifier_aux.n_tilde) ||
+      !IsInRange(proof.w, verifier_aux.n_tilde) ||
+      !IsZnStarElement(proof.s, n)) {
+    return false;
+  }
+  if (proof.s1 < 0 || proof.s1 > QPow3()) {
+    return false;
+  }
+  if (proof.s2 < 0) {
+    return false;
+  }
+
+  const Scalar e_scalar = BuildA1RangeChallenge(ctx, n, gamma, verifier_aux, c, proof.z, proof.u, proof.w);
+  const mpz_class& e = e_scalar.value();
+
+  const mpz_class c_pow_e = PowMod(c, e, n2);
+  const std::optional<mpz_class> c_pow_e_inv = InvertMod(c_pow_e, n2);
+  if (!c_pow_e_inv.has_value()) {
+    return false;
+  }
+
+  mpz_class rhs_u = MulMod(PowMod(gamma, proof.s1, n2), PowMod(proof.s, n, n2), n2);
+  rhs_u = MulMod(rhs_u, *c_pow_e_inv, n2);
+  if (NormalizeMod(proof.u, n2) != rhs_u) {
+    return false;
+  }
+
+  const mpz_class lhs_n_tilde =
+      MulMod(PowMod(verifier_aux.h1, proof.s1, verifier_aux.n_tilde),
+             PowMod(verifier_aux.h2, proof.s2, verifier_aux.n_tilde),
+             verifier_aux.n_tilde);
+  const mpz_class rhs_n_tilde =
+      MulMod(proof.w, PowMod(proof.z, e, verifier_aux.n_tilde), verifier_aux.n_tilde);
+  return lhs_n_tilde == rhs_n_tilde;
+}
+
+A2MtAwcProof ProveA2MtAwc(const MtaProofContext& ctx,
+                          const mpz_class& n,
+                          const AuxRsaParams& verifier_aux,
+                          const mpz_class& c1,
+                          const mpz_class& c2,
+                          const ECPoint& statement_x,
+                          const mpz_class& witness_x,
+                          const mpz_class& witness_y,
+                          const mpz_class& witness_r) {
+  const mpz_class n2 = n * n;
+  const mpz_class gamma = n + 1;
+  const mpz_class q_mul_n_tilde = Scalar::ModulusQ() * verifier_aux.n_tilde;
+  const mpz_class q3_mul_n_tilde = QPow3() * verifier_aux.n_tilde;
+
+  while (true) {
+    const mpz_class alpha = RandomBelow(QPow3());
+    const Scalar alpha_scalar(alpha);
+    if (alpha_scalar.value() == 0) {
+      continue;
+    }
+
+    const mpz_class rho = RandomBelow(q_mul_n_tilde);
+    const mpz_class rho2 = RandomBelow(q3_mul_n_tilde);
+    const mpz_class sigma = RandomBelow(q_mul_n_tilde);
+    const mpz_class beta = SampleZnStar(n);
+    const mpz_class gamma_rand = RandomBelow(QPow7());
+    const mpz_class tau = RandomBelow(q3_mul_n_tilde);
+
+    const ECPoint u = ECPoint::GeneratorMultiply(alpha_scalar);
+    const mpz_class z =
+        MulMod(PowMod(verifier_aux.h1, witness_x, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, rho, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+    const mpz_class z2 =
+        MulMod(PowMod(verifier_aux.h1, alpha, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, rho2, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+    const mpz_class t =
+        MulMod(PowMod(verifier_aux.h1, witness_y, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, sigma, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+
+    mpz_class v = MulMod(PowMod(c1, alpha, n2), PowMod(gamma, gamma_rand, n2), n2);
+    v = MulMod(v, PowMod(beta, n, n2), n2);
+    const mpz_class w =
+        MulMod(PowMod(verifier_aux.h1, gamma_rand, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, tau, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+
+    A2MtAwcProof proof{
+        .u = u,
+        .z = z,
+        .z2 = z2,
+        .t = t,
+        .v = v,
+        .w = w,
+    };
+    const Scalar e_scalar =
+        BuildA2MtAwcChallenge(ctx, n, gamma, verifier_aux, c1, c2, statement_x, proof);
+    const mpz_class& e = e_scalar.value();
+
+    proof.s = MulMod(PowMod(witness_r, e, n), beta, n);
+    proof.s1 = (e * witness_x) + alpha;
+    proof.s2 = (e * rho) + rho2;
+    proof.t1 = (e * witness_y) + gamma_rand;
+    proof.t2 = (e * sigma) + tau;
+    if (proof.s1 > QPow3() || proof.t1 > QPow7()) {
+      continue;
+    }
+    return proof;
+  }
+}
+
+bool VerifyA2MtAwc(const MtaProofContext& ctx,
+                   const mpz_class& n,
+                   const AuxRsaParams& verifier_aux,
+                   const mpz_class& c1,
+                   const mpz_class& c2,
+                   const ECPoint& statement_x,
+                   const A2MtAwcProof& proof) {
+  const mpz_class n2 = n * n;
+  const mpz_class gamma = n + 1;
+
+  if (!IsInRange(c1, n2) || !IsInRange(c2, n2) ||
+      !IsInRange(proof.v, n2) || !IsInRange(proof.z, verifier_aux.n_tilde) ||
+      !IsInRange(proof.z2, verifier_aux.n_tilde) ||
+      !IsInRange(proof.t, verifier_aux.n_tilde) ||
+      !IsInRange(proof.w, verifier_aux.n_tilde) ||
+      !IsZnStarElement(proof.s, n)) {
+    return false;
+  }
+  if (proof.s1 < 0 || proof.s1 > QPow3() || proof.t1 < 0 || proof.t1 > QPow7() ||
+      proof.s2 < 0 || proof.t2 < 0) {
+    return false;
+  }
+
+  const Scalar e_scalar =
+      BuildA2MtAwcChallenge(ctx, n, gamma, verifier_aux, c1, c2, statement_x, proof);
+
+  try {
+    const Scalar s1_mod_q(proof.s1);
+    if (s1_mod_q.value() == 0) {
+      return false;
+    }
+    const ECPoint lhs_curve = ECPoint::GeneratorMultiply(s1_mod_q);
+    ECPoint rhs_curve = proof.u;
+    if (e_scalar.value() != 0) {
+      rhs_curve = rhs_curve.Add(statement_x.Mul(e_scalar));
+    }
+    if (lhs_curve != rhs_curve) {
+      return false;
+    }
+  } catch (const std::exception&) {
+    return false;
+  }
+
+  const mpz_class& e = e_scalar.value();
+  const mpz_class lhs_nt_1 =
+      MulMod(PowMod(verifier_aux.h1, proof.s1, verifier_aux.n_tilde),
+             PowMod(verifier_aux.h2, proof.s2, verifier_aux.n_tilde),
+             verifier_aux.n_tilde);
+  const mpz_class rhs_nt_1 =
+      MulMod(PowMod(proof.z, e, verifier_aux.n_tilde), proof.z2, verifier_aux.n_tilde);
+  if (lhs_nt_1 != rhs_nt_1) {
+    return false;
+  }
+
+  const mpz_class lhs_nt_2 =
+      MulMod(PowMod(verifier_aux.h1, proof.t1, verifier_aux.n_tilde),
+             PowMod(verifier_aux.h2, proof.t2, verifier_aux.n_tilde),
+             verifier_aux.n_tilde);
+  const mpz_class rhs_nt_2 =
+      MulMod(PowMod(proof.t, e, verifier_aux.n_tilde), proof.w, verifier_aux.n_tilde);
+  if (lhs_nt_2 != rhs_nt_2) {
+    return false;
+  }
+
+  mpz_class lhs_paillier = MulMod(PowMod(c1, proof.s1, n2), PowMod(proof.s, n, n2), n2);
+  lhs_paillier = MulMod(lhs_paillier, PowMod(gamma, proof.t1, n2), n2);
+  const mpz_class rhs_paillier = MulMod(PowMod(c2, e, n2), proof.v, n2);
+  return lhs_paillier == rhs_paillier;
+}
+
+A3MtAProof ProveA3MtA(const MtaProofContext& ctx,
+                      const mpz_class& n,
+                      const AuxRsaParams& verifier_aux,
+                      const mpz_class& c1,
+                      const mpz_class& c2,
+                      const mpz_class& witness_x,
+                      const mpz_class& witness_y,
+                      const mpz_class& witness_r) {
+  const mpz_class n2 = n * n;
+  const mpz_class gamma = n + 1;
+  const mpz_class q_mul_n_tilde = Scalar::ModulusQ() * verifier_aux.n_tilde;
+  const mpz_class q3_mul_n_tilde = QPow3() * verifier_aux.n_tilde;
+
+  while (true) {
+    const mpz_class alpha = RandomBelow(QPow3());
+    const mpz_class rho = RandomBelow(q_mul_n_tilde);
+    const mpz_class rho2 = RandomBelow(q3_mul_n_tilde);
+    const mpz_class sigma = RandomBelow(q_mul_n_tilde);
+    const mpz_class beta = SampleZnStar(n);
+    const mpz_class gamma_rand = RandomBelow(QPow7());
+    const mpz_class tau = RandomBelow(q3_mul_n_tilde);
+
+    const mpz_class z =
+        MulMod(PowMod(verifier_aux.h1, witness_x, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, rho, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+    const mpz_class z2 =
+        MulMod(PowMod(verifier_aux.h1, alpha, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, rho2, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+    const mpz_class t =
+        MulMod(PowMod(verifier_aux.h1, witness_y, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, sigma, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+    mpz_class v = MulMod(PowMod(c1, alpha, n2), PowMod(gamma, gamma_rand, n2), n2);
+    v = MulMod(v, PowMod(beta, n, n2), n2);
+    const mpz_class w =
+        MulMod(PowMod(verifier_aux.h1, gamma_rand, verifier_aux.n_tilde),
+               PowMod(verifier_aux.h2, tau, verifier_aux.n_tilde),
+               verifier_aux.n_tilde);
+
+    A3MtAProof proof{
+        .z = z,
+        .z2 = z2,
+        .t = t,
+        .v = v,
+        .w = w,
+    };
+    const Scalar e_scalar = BuildA3MtAChallenge(ctx, n, gamma, verifier_aux, c1, c2, proof);
+    const mpz_class& e = e_scalar.value();
+
+    proof.s = MulMod(PowMod(witness_r, e, n), beta, n);
+    proof.s1 = (e * witness_x) + alpha;
+    proof.s2 = (e * rho) + rho2;
+    proof.t1 = (e * witness_y) + gamma_rand;
+    proof.t2 = (e * sigma) + tau;
+    if (proof.s1 > QPow3() || proof.t1 > QPow7()) {
+      continue;
+    }
+    return proof;
+  }
+}
+
+bool VerifyA3MtA(const MtaProofContext& ctx,
+                 const mpz_class& n,
+                 const AuxRsaParams& verifier_aux,
+                 const mpz_class& c1,
+                 const mpz_class& c2,
+                 const A3MtAProof& proof) {
+  const mpz_class n2 = n * n;
+  const mpz_class gamma = n + 1;
+
+  if (!IsInRange(c1, n2) || !IsInRange(c2, n2) ||
+      !IsInRange(proof.v, n2) || !IsInRange(proof.z, verifier_aux.n_tilde) ||
+      !IsInRange(proof.z2, verifier_aux.n_tilde) ||
+      !IsInRange(proof.t, verifier_aux.n_tilde) ||
+      !IsInRange(proof.w, verifier_aux.n_tilde) ||
+      !IsZnStarElement(proof.s, n)) {
+    return false;
+  }
+  if (proof.s1 < 0 || proof.s1 > QPow3() || proof.t1 < 0 || proof.t1 > QPow7() ||
+      proof.s2 < 0 || proof.t2 < 0) {
+    return false;
+  }
+
+  const Scalar e_scalar = BuildA3MtAChallenge(ctx, n, gamma, verifier_aux, c1, c2, proof);
+  const mpz_class& e = e_scalar.value();
+
+  const mpz_class lhs_nt_1 =
+      MulMod(PowMod(verifier_aux.h1, proof.s1, verifier_aux.n_tilde),
+             PowMod(verifier_aux.h2, proof.s2, verifier_aux.n_tilde),
+             verifier_aux.n_tilde);
+  const mpz_class rhs_nt_1 =
+      MulMod(PowMod(proof.z, e, verifier_aux.n_tilde), proof.z2, verifier_aux.n_tilde);
+  if (lhs_nt_1 != rhs_nt_1) {
+    return false;
+  }
+
+  const mpz_class lhs_nt_2 =
+      MulMod(PowMod(verifier_aux.h1, proof.t1, verifier_aux.n_tilde),
+             PowMod(verifier_aux.h2, proof.t2, verifier_aux.n_tilde),
+             verifier_aux.n_tilde);
+  const mpz_class rhs_nt_2 =
+      MulMod(PowMod(proof.t, e, verifier_aux.n_tilde), proof.w, verifier_aux.n_tilde);
+  if (lhs_nt_2 != rhs_nt_2) {
+    return false;
+  }
+
+  mpz_class lhs_paillier = MulMod(PowMod(c1, proof.s1, n2), PowMod(proof.s, n, n2), n2);
+  lhs_paillier = MulMod(lhs_paillier, PowMod(gamma, proof.t1, n2), n2);
+  const mpz_class rhs_paillier = MulMod(PowMod(c2, e, n2), proof.v, n2);
+  return lhs_paillier == rhs_paillier;
+}
+
+void AppendA1RangeProof(const A1RangeProof& proof, Bytes* out) {
+  AppendMpzField(proof.z, out);
+  AppendMpzField(proof.u, out);
+  AppendMpzField(proof.w, out);
+  AppendMpzField(proof.s, out);
+  AppendMpzField(proof.s1, out);
+  AppendMpzField(proof.s2, out);
+}
+
+A1RangeProof ReadA1RangeProof(std::span<const uint8_t> input, size_t* offset) {
+  A1RangeProof proof;
+  proof.z = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A1.z");
+  proof.u = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A1.u");
+  proof.w = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A1.w");
+  proof.s = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A1.s");
+  proof.s1 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A1.s1");
+  proof.s2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A1.s2");
+  return proof;
+}
+
+void AppendA2MtAwcProof(const A2MtAwcProof& proof, Bytes* out) {
+  AppendPoint(proof.u, out);
+  AppendMpzField(proof.z, out);
+  AppendMpzField(proof.z2, out);
+  AppendMpzField(proof.t, out);
+  AppendMpzField(proof.v, out);
+  AppendMpzField(proof.w, out);
+  AppendMpzField(proof.s, out);
+  AppendMpzField(proof.s1, out);
+  AppendMpzField(proof.s2, out);
+  AppendMpzField(proof.t1, out);
+  AppendMpzField(proof.t2, out);
+}
+
+A2MtAwcProof ReadA2MtAwcProof(std::span<const uint8_t> input, size_t* offset) {
+  A2MtAwcProof proof{
+      .u = ReadPoint(input, offset),
+  };
+  proof.z = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.z");
+  proof.z2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.z2");
+  proof.t = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.t");
+  proof.v = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.v");
+  proof.w = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.w");
+  proof.s = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.s");
+  proof.s1 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.s1");
+  proof.s2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.s2");
+  proof.t1 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.t1");
+  proof.t2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A2.t2");
+  return proof;
+}
+
+void AppendA3MtAProof(const A3MtAProof& proof, Bytes* out) {
+  AppendMpzField(proof.z, out);
+  AppendMpzField(proof.z2, out);
+  AppendMpzField(proof.t, out);
+  AppendMpzField(proof.v, out);
+  AppendMpzField(proof.w, out);
+  AppendMpzField(proof.s, out);
+  AppendMpzField(proof.s1, out);
+  AppendMpzField(proof.s2, out);
+  AppendMpzField(proof.t1, out);
+  AppendMpzField(proof.t2, out);
+}
+
+A3MtAProof ReadA3MtAProof(std::span<const uint8_t> input, size_t* offset) {
+  A3MtAProof proof;
+  proof.z = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.z");
+  proof.z2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.z2");
+  proof.t = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.t");
+  proof.v = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.v");
+  proof.w = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.w");
+  proof.s = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.s");
+  proof.s1 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.s1");
+  proof.s2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.s2");
+  proof.t1 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.t1");
+  proof.t2 = ReadMpzField(input, offset, kMaxMpzEncodedLen, "A3.t2");
+  return proof;
 }
 
 Bytes RandomMtaInstanceId() {
@@ -456,6 +1128,7 @@ SignSession::SignSession(SignSessionConfig cfg)
       peers_(BuildPeerSet(participants_, cfg.self_id)),
       all_X_i_(std::move(cfg.all_X_i)),
       all_paillier_public_(std::move(cfg.all_paillier_public)),
+      all_aux_rsa_params_(std::move(cfg.all_aux_rsa_params)),
       local_paillier_(std::move(cfg.local_paillier)),
       local_x_i_(cfg.x_i),
       public_key_y_(cfg.y),
@@ -485,6 +1158,12 @@ SignSession::SignSession(SignSessionConfig cfg)
     if (paillier_it->second.n <= 1) {
       throw std::invalid_argument("Paillier modulus must be > 1");
     }
+
+    const auto aux_it = all_aux_rsa_params_.find(party);
+    if (aux_it == all_aux_rsa_params_.end()) {
+      throw std::invalid_argument("all_aux_rsa_params is missing participant params");
+    }
+    ValidateAuxRsaParamsOrThrow(aux_it->second);
   }
   const auto self_pk_it = all_paillier_public_.find(self_id());
   if (self_pk_it == all_paillier_public_.end()) {
@@ -996,6 +1675,7 @@ bool SignSession::HandlePhase2InitEnvelope(const Envelope& envelope) {
     }
     const mpz_class c1 =
         ReadMpzField(envelope.payload, &offset, kMaxMpzEncodedLen, "phase2 mta ciphertext c1");
+    const A1RangeProof a1_proof = ReadA1RangeProof(envelope.payload, &offset);
     if (offset != envelope.payload.size()) {
       throw std::invalid_argument("sign phase2 init payload has trailing bytes");
     }
@@ -1008,6 +1688,19 @@ bool SignSession::HandlePhase2InitEnvelope(const Envelope& envelope) {
     const mpz_class n2 = n * n;
     if (c1 < 0 || c1 >= n2) {
       throw std::invalid_argument("phase2 c1 is out of range");
+    }
+    const auto self_aux_it = all_aux_rsa_params_.find(self_id());
+    if (self_aux_it == all_aux_rsa_params_.end()) {
+      throw std::invalid_argument("missing responder auxiliary parameters");
+    }
+    const MtaProofContext init_ctx{
+        .session_id = session_id(),
+        .initiator_id = envelope.from,
+        .responder_id = self_id(),
+        .mta_instance_id = instance_id,
+    };
+    if (!VerifyA1Range(init_ctx, n, self_aux_it->second, c1, a1_proof)) {
+      throw std::invalid_argument("phase2 A1 range proof verification failed");
     }
 
     const std::string request_key = MakeResponderRequestKey(envelope.from, static_cast<uint8_t>(raw_type));
@@ -1046,10 +1739,49 @@ bool SignSession::HandlePhase2InitEnvelope(const Envelope& envelope) {
     }
     phase2_responder_requests_seen_.emplace(request_key, instance_key);
 
+    const auto initiator_aux_it = all_aux_rsa_params_.find(envelope.from);
+    if (initiator_aux_it == all_aux_rsa_params_.end()) {
+      throw std::invalid_argument("missing initiator auxiliary parameters");
+    }
+    const MtaProofContext response_ctx{
+        .session_id = session_id(),
+        .initiator_id = envelope.from,
+        .responder_id = self_id(),
+        .mta_instance_id = instance_id,
+    };
+
     Bytes payload;
     AppendU32Be(raw_type, &payload);
     AppendSizedField(instance_id, &payload);
     AppendMpzField(c2, &payload);
+    if (mta_type == MtaType::kTimesGamma) {
+      const A3MtAProof a3_proof =
+          ProveA3MtA(response_ctx,
+                     n,
+                     initiator_aux_it->second,
+                     c1,
+                     c2,
+                     witness.value(),
+                     y,
+                     r_b);
+      AppendA3MtAProof(a3_proof, &payload);
+    } else {
+      const auto statement_x_it = W_points_.find(self_id());
+      if (statement_x_it == W_points_.end()) {
+        throw std::invalid_argument("missing responder W_j point for MtAwc proof");
+      }
+      const A2MtAwcProof a2_proof =
+          ProveA2MtAwc(response_ctx,
+                       n,
+                       initiator_aux_it->second,
+                       c1,
+                       c2,
+                       statement_x_it->second,
+                       witness.value(),
+                       y,
+                       r_b);
+      AppendA2MtAwcProof(a2_proof, &payload);
+    }
 
     Envelope out;
     out.session_id = session_id();
@@ -1091,6 +1823,13 @@ bool SignSession::HandlePhase2ResponseEnvelope(const Envelope& envelope) {
     }
     const mpz_class c2 =
         ReadMpzField(envelope.payload, &offset, kMaxMpzEncodedLen, "phase2 mta ciphertext c2");
+    std::optional<A3MtAProof> a3_proof;
+    std::optional<A2MtAwcProof> a2_proof;
+    if (mta_type == MtaType::kTimesGamma) {
+      a3_proof = ReadA3MtAProof(envelope.payload, &offset);
+    } else {
+      a2_proof = ReadA2MtAwcProof(envelope.payload, &offset);
+    }
     if (offset != envelope.payload.size()) {
       throw std::invalid_argument("sign phase2 response payload has trailing bytes");
     }
@@ -1115,9 +1854,45 @@ bool SignSession::HandlePhase2ResponseEnvelope(const Envelope& envelope) {
     if (self_pk_it == all_paillier_public_.end()) {
       throw std::invalid_argument("missing self Paillier public key");
     }
-    const mpz_class n2 = self_pk_it->second.n * self_pk_it->second.n;
+    const mpz_class& n = self_pk_it->second.n;
+    const mpz_class n2 = n * n;
     if (c2 < 0 || c2 >= n2) {
       throw std::invalid_argument("phase2 c2 is out of range");
+    }
+    const auto self_aux_it = all_aux_rsa_params_.find(self_id());
+    if (self_aux_it == all_aux_rsa_params_.end()) {
+      throw std::invalid_argument("missing initiator auxiliary parameters");
+    }
+    const MtaProofContext response_ctx{
+        .session_id = session_id(),
+        .initiator_id = self_id(),
+        .responder_id = envelope.from,
+        .mta_instance_id = instance_id,
+    };
+    if (mta_type == MtaType::kTimesGamma) {
+      if (!a3_proof.has_value()) {
+        throw std::invalid_argument("missing A3 proof in MtA response");
+      }
+      if (!VerifyA3MtA(response_ctx, n, self_aux_it->second, instance.c1, c2, *a3_proof)) {
+        throw std::invalid_argument("phase2 A3 proof verification failed");
+      }
+    } else {
+      if (!a2_proof.has_value()) {
+        throw std::invalid_argument("missing A2 proof in MtAwc response");
+      }
+      const auto statement_x_it = W_points_.find(envelope.from);
+      if (statement_x_it == W_points_.end()) {
+        throw std::invalid_argument("missing W_j point for MtAwc response proof");
+      }
+      if (!VerifyA2MtAwc(response_ctx,
+                         n,
+                         self_aux_it->second,
+                         instance.c1,
+                         c2,
+                         statement_x_it->second,
+                         *a2_proof)) {
+        throw std::invalid_argument("phase2 A2 proof verification failed");
+      }
     }
 
     const mpz_class decrypted = local_paillier_->Decrypt(c2);
@@ -1476,7 +2251,9 @@ void SignSession::InitializePhase2InstancesIfNeeded() {
         instance_key = BytesToKey(instance_id);
       }
 
-      const mpz_class c1 = local_paillier_->Encrypt(local_k_i_.value());
+      const PaillierCiphertextWithRandom encrypted = local_paillier_->EncryptWithRandom(local_k_i_.value());
+      const mpz_class c1 = encrypted.ciphertext;
+      const mpz_class c1_randomness = encrypted.randomness;
       phase2_initiator_instances_.emplace(
           instance_key,
           Phase2InitiatorInstance{
@@ -1484,13 +2261,34 @@ void SignSession::InitializePhase2InstancesIfNeeded() {
               .type = type,
               .instance_id = instance_id,
               .c1 = c1,
+              .c1_randomness = c1_randomness,
               .response_received = false,
           });
+
+      const auto self_pk_it = all_paillier_public_.find(self_id());
+      const auto peer_aux_it = all_aux_rsa_params_.find(peer);
+      if (self_pk_it == all_paillier_public_.end() || peer_aux_it == all_aux_rsa_params_.end()) {
+        throw std::logic_error("missing local Paillier or peer auxiliary parameters for phase2 init");
+      }
+      const MtaProofContext proof_ctx{
+          .session_id = session_id(),
+          .initiator_id = self_id(),
+          .responder_id = peer,
+          .mta_instance_id = instance_id,
+      };
+      const A1RangeProof a1_proof =
+          ProveA1Range(proof_ctx,
+                       self_pk_it->second.n,
+                       peer_aux_it->second,
+                       c1,
+                       local_k_i_.value(),
+                       c1_randomness);
 
       Bytes payload;
       AppendU32Be(static_cast<uint32_t>(type), &payload);
       AppendSizedField(instance_id, &payload);
       AppendMpzField(c1, &payload);
+      AppendA1RangeProof(a1_proof, &payload);
 
       Envelope out;
       out.session_id = session_id();

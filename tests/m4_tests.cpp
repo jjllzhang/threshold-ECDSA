@@ -29,6 +29,51 @@ using tecdsa::SignPhase5Stage;
 using tecdsa::SignSession;
 using tecdsa::SignSessionConfig;
 
+std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> BuildAuxParamsFromPaillier(
+    const std::vector<PartyIndex>& signers,
+    const std::unordered_map<PartyIndex, tecdsa::PaillierPublicKey>& paillier_public) {
+  std::unordered_map<PartyIndex, SignSessionConfig::AuxRsaParams> out;
+  out.reserve(signers.size());
+
+  auto pick_coprime = [](const mpz_class& modulus, const mpz_class& seed) {
+    mpz_class value = seed % modulus;
+    if (value < 2) {
+      value = 2;
+    }
+    while (true) {
+      if (value >= modulus) {
+        value = 2;
+      }
+      mpz_class gcd;
+      mpz_gcd(gcd.get_mpz_t(), value.get_mpz_t(), modulus.get_mpz_t());
+      if (gcd == 1) {
+        return value;
+      }
+      ++value;
+    }
+  };
+
+  for (PartyIndex party : signers) {
+    const auto pub_it = paillier_public.find(party);
+    if (pub_it == paillier_public.end()) {
+      throw std::runtime_error("missing Paillier public key while building aux params");
+    }
+    const mpz_class n_tilde = pub_it->second.n;
+    const mpz_class h1 = pick_coprime(n_tilde, mpz_class(2 + 2 * party));
+    mpz_class h2 = pick_coprime(n_tilde, mpz_class(3 + 2 * party));
+    if (h2 == h1) {
+      h2 = pick_coprime(n_tilde, h1 + 1);
+    }
+    out.emplace(party, SignSessionConfig::AuxRsaParams{
+                          .n_tilde = n_tilde,
+                          .h1 = h1,
+                          .h2 = h2,
+                      });
+  }
+
+  return out;
+}
+
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error("Test failed: " + message);
@@ -225,6 +270,7 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     paillier_public.emplace(party, paillier_pub_it->second);
     paillier_private.emplace(party, party_result_it->second.local_paillier);
   }
+  const auto aux_params = BuildAuxParamsFromPaillier(fixture.signers, paillier_public);
 
   for (PartyIndex self_id : fixture.signers) {
     const auto keygen_it = keygen_results.find(self_id);
@@ -241,6 +287,7 @@ std::vector<std::unique_ptr<SignSession>> BuildSignSessions(
     cfg.y = baseline_it->second.y;
     cfg.all_X_i = all_X_i_subset;
     cfg.all_paillier_public = paillier_public;
+    cfg.all_aux_rsa_params = aux_params;
     cfg.local_paillier = paillier_private.at(self_id);
     cfg.msg32 = fixture.msg32;
     cfg.fixed_k_i = fixture.fixed_k.at(self_id);
@@ -583,6 +630,123 @@ void TestM5Phase2InstanceIdMismatchAborts() {
   Expect(any_aborted, "At least one signer must abort on mismatched phase2 instance id");
 }
 
+void TestM7TamperedPhase2A1ProofAbortsResponder() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD7, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE7, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  std::vector<Envelope> phase2_init = CollectPhase2Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase2_init) {
+    if (envelope.type == SignSession::MessageTypeForPhase(SignPhase::kPhase2) &&
+        envelope.from == 1 &&
+        envelope.to == 2 &&
+        !envelope.payload.empty()) {
+      envelope.payload.back() ^= 0x01;
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase2 init A1 proof payload to tamper");
+
+  for (const Envelope& envelope : phase2_init) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Responder must abort when phase2 A1 proof is tampered");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Phase2 A1 proof failure must not expose signature");
+  }
+}
+
+void TestM7TamperedPhase2A3ProofAbortsInitiator() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD8, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE8, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+  DeliverSignEnvelopesOrThrow(CollectPhase2Messages(&sessions), signers, &sessions);
+
+  std::vector<Envelope> phase2_responses = CollectPhase2Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase2_responses) {
+    if (envelope.type != SignSession::Phase2ResponseMessageType() ||
+        envelope.from != 2 ||
+        envelope.to != 1 ||
+        envelope.payload.size() < 4) {
+      continue;
+    }
+    const uint32_t raw_type = ReadU32Be(envelope.payload, 0);
+    if (raw_type != 1) {  // MtA (times-gamma) uses A3
+      continue;
+    }
+    envelope.payload.back() ^= 0x01;
+    tampered = true;
+    break;
+  }
+  Expect(tampered, "Test setup failed to locate phase2 response A3 proof payload to tamper");
+
+  for (const Envelope& envelope : phase2_responses) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t initiator_idx = FindPartyIndexOrThrow(signers, 1);
+  Expect(sessions[initiator_idx]->status() == SessionStatus::kAborted,
+         "Initiator must abort when phase2 A3 proof is tampered");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Phase2 A3 proof failure must not expose signature");
+  }
+}
+
+void TestM7TamperedPhase2A2ProofAbortsInitiator() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD9, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xE9, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+  DeliverSignEnvelopesOrThrow(CollectPhase2Messages(&sessions), signers, &sessions);
+
+  std::vector<Envelope> phase2_responses = CollectPhase2Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase2_responses) {
+    if (envelope.type != SignSession::Phase2ResponseMessageType() ||
+        envelope.from != 2 ||
+        envelope.to != 1 ||
+        envelope.payload.size() < 4) {
+      continue;
+    }
+    const uint32_t raw_type = ReadU32Be(envelope.payload, 0);
+    if (raw_type != 2) {  // MtAwc (times-w) uses A2
+      continue;
+    }
+    envelope.payload.back() ^= 0x01;
+    tampered = true;
+    break;
+  }
+  Expect(tampered, "Test setup failed to locate phase2 response A2 proof payload to tamper");
+
+  for (const Envelope& envelope : phase2_responses) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t initiator_idx = FindPartyIndexOrThrow(signers, 1);
+  Expect(sessions[initiator_idx]->status() == SessionStatus::kAborted,
+         "Initiator must abort when phase2 A2 proof is tampered");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Phase2 A2 proof failure must not expose signature");
+  }
+}
+
 void TestM6TamperedPhase4GammaSchnorrAbortsReceiver() {
   const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xD4, 0x03, 0x01});
   const std::vector<PartyIndex> signers = {1, 2};
@@ -718,6 +882,9 @@ int main() {
     TestM4SignEndToEndProducesVerifiableSignature();
     TestM4Phase5DFailurePreventsPhase5EReveal();
     TestM5Phase2InstanceIdMismatchAborts();
+    TestM7TamperedPhase2A1ProofAbortsResponder();
+    TestM7TamperedPhase2A3ProofAbortsInitiator();
+    TestM7TamperedPhase2A2ProofAbortsInitiator();
     TestM6TamperedPhase4GammaSchnorrAbortsReceiver();
     TestM6TamperedPhase5BASchnorrAbortsReceiver();
     TestM6TamperedPhase5BVRelationAbortsReceiver();
@@ -726,6 +893,6 @@ int main() {
     return 1;
   }
 
-  std::cout << "M4/M5/M6 tests passed" << '\n';
+  std::cout << "M4/M5/M6/M7 tests passed" << '\n';
   return 0;
 }
