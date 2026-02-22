@@ -12,6 +12,7 @@
 #include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/crypto/random.hpp"
 #include "tecdsa/crypto/transcript.hpp"
+#include "tecdsa/common/secure_zeroize.hpp"
 
 namespace tecdsa {
 namespace {
@@ -269,6 +270,14 @@ uint32_t KeygenSession::threshold() const {
   return threshold_;
 }
 
+bool KeygenSession::PollTimeout(std::chrono::steady_clock::time_point now) {
+  const bool timed_out = Session::PollTimeout(now);
+  if (timed_out) {
+    ClearSensitiveIntermediates();
+  }
+  return timed_out;
+}
+
 bool KeygenSession::HandleEnvelope(const Envelope& envelope) {
   if (PollTimeout()) {
     return false;
@@ -344,6 +353,48 @@ uint32_t KeygenSession::MessageTypeForPhase(KeygenPhase phase) {
 
 uint32_t KeygenSession::Phase2ShareMessageType() {
   return static_cast<uint32_t>(KeygenMessageType::kPhase2Share);
+}
+
+void KeygenSession::ClearSensitiveIntermediates() {
+  SecureZeroize(&local_poly_coefficients_);
+  SecureZeroize(&local_shares_);
+  SecureZeroize(&pending_phase2_shares_);
+  SecureZeroize(&phase2_verified_shares_);
+  SecureZeroize(&local_open_randomness_);
+  SecureZeroize(&local_commitment_);
+
+  if (local_phase3_payload_.has_value()) {
+    SecureZeroize(&local_phase3_payload_->proof.z);
+    local_phase3_payload_.reset();
+  }
+
+  for (auto& [party, open_data] : phase2_open_data_) {
+    (void)party;
+    SecureZeroize(&open_data.randomness);
+  }
+  phase2_open_data_.clear();
+
+  for (auto& [party, phase3_data] : phase3_broadcasts_) {
+    (void)party;
+    SecureZeroize(&phase3_data.proof.z);
+  }
+  phase3_broadcasts_.clear();
+}
+
+void KeygenSession::Abort(const std::string& reason) {
+  if (IsTerminal()) {
+    return;
+  }
+  ClearSensitiveIntermediates();
+  Session::Abort(reason);
+}
+
+void KeygenSession::Complete() {
+  if (IsTerminal()) {
+    return;
+  }
+  ClearSensitiveIntermediates();
+  Session::Complete();
 }
 
 Envelope KeygenSession::BuildPhase1CommitEnvelope() {

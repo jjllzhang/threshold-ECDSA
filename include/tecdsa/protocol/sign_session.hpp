@@ -104,6 +104,8 @@ class SignSession : public Session {
 
   bool HandleEnvelope(const Envelope& envelope);
   Envelope MakePhaseBroadcastEnvelope(const Bytes& payload) const;
+  bool PollTimeout(std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now());
 
   bool HasResult() const;
   const SignResult& result() const;
@@ -188,6 +190,9 @@ class SignSession : public Session {
   void MaybeAdvanceAfterPhase5C();
   void MaybeAdvanceAfterPhase5D();
   void MaybeAdvanceAfterPhase5E();
+  void ClearSensitiveIntermediates();
+  void Abort(const std::string& reason);
+  void Complete();
   SchnorrProof BuildSchnorrProof(const ECPoint& statement, const Scalar& witness) const;
   bool VerifySchnorrProof(PartyIndex prover_id,
                           const ECPoint& statement,

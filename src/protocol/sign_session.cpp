@@ -23,6 +23,7 @@ extern "C" {
 #include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/crypto/random.hpp"
 #include "tecdsa/crypto/transcript.hpp"
+#include "tecdsa/common/secure_zeroize.hpp"
 #include "tecdsa/common/thread_pool.hpp"
 
 namespace tecdsa {
@@ -1690,6 +1691,14 @@ const SignResult& SignSession::result() const {
   return result_;
 }
 
+bool SignSession::PollTimeout(std::chrono::steady_clock::time_point now) {
+  const bool timed_out = Session::PollTimeout(now);
+  if (timed_out) {
+    ClearSensitiveIntermediates();
+  }
+  return timed_out;
+}
+
 uint32_t SignSession::MessageTypeForPhase(SignPhase phase) {
   switch (phase) {
     case SignPhase::kPhase1:
@@ -1710,6 +1719,94 @@ uint32_t SignSession::MessageTypeForPhase(SignPhase phase) {
 
 uint32_t SignSession::Phase2ResponseMessageType() {
   return static_cast<uint32_t>(SignMessageType::kPhase2Response);
+}
+
+void SignSession::ClearSensitiveIntermediates() {
+  SecureZeroize(&local_x_i_);
+  SecureZeroize(&local_w_i_);
+  SecureZeroize(&local_k_i_);
+  SecureZeroize(&local_gamma_i_);
+  SecureZeroize(&local_delta_i_);
+  SecureZeroize(&local_sigma_i_);
+  SecureZeroize(&delta_);
+  SecureZeroize(&delta_inv_);
+  SecureZeroize(&local_s_i_);
+  SecureZeroize(&local_l_i_);
+  SecureZeroize(&local_rho_i_);
+  SecureZeroize(&s_);
+  SecureZeroize(&phase2_mta_initiator_sum_);
+  SecureZeroize(&phase2_mta_responder_sum_);
+  SecureZeroize(&phase2_mtawc_initiator_sum_);
+  SecureZeroize(&phase2_mtawc_responder_sum_);
+
+  SecureZeroize(&fixed_k_i_);
+  SecureZeroize(&fixed_gamma_i_);
+  SecureZeroize(&local_phase1_randomness_);
+  SecureZeroize(&local_phase1_commitment_);
+  SecureZeroize(&local_phase5a_randomness_);
+  SecureZeroize(&local_phase5a_commitment_);
+  SecureZeroize(&local_phase5c_randomness_);
+  SecureZeroize(&local_phase5c_commitment_);
+
+  SecureZeroize(&lagrange_coefficients_);
+  SecureZeroize(&w_shares_);
+  SecureZeroize(&phase3_delta_shares_);
+  SecureZeroize(&phase5e_revealed_s_);
+  SecureZeroize(&phase1_commitments_);
+  SecureZeroize(&phase5a_commitments_);
+  SecureZeroize(&phase5c_commitments_);
+
+  for (auto& [instance_key, instance] : phase2_initiator_instances_) {
+    (void)instance_key;
+    instance.c1 = 0;
+    instance.c1_randomness = 0;
+    SecureZeroize(&instance.instance_id);
+  }
+  phase2_initiator_instances_.clear();
+  phase2_responder_requests_seen_.clear();
+
+  for (Envelope& envelope : phase2_outbox_) {
+    SecureZeroize(&envelope.payload);
+  }
+  phase2_outbox_.clear();
+
+  for (auto& [party, open_data] : phase4_open_data_) {
+    (void)party;
+    SecureZeroize(&open_data.gamma_proof.z);
+    SecureZeroize(&open_data.randomness);
+  }
+  phase4_open_data_.clear();
+
+  for (auto& [party, open_data] : phase5b_open_data_) {
+    (void)party;
+    SecureZeroize(&open_data.a_schnorr_proof.z);
+    SecureZeroize(&open_data.v_relation_proof.t);
+    SecureZeroize(&open_data.v_relation_proof.u);
+    SecureZeroize(&open_data.randomness);
+  }
+  phase5b_open_data_.clear();
+
+  for (auto& [party, open_data] : phase5d_open_data_) {
+    (void)party;
+    SecureZeroize(&open_data.randomness);
+  }
+  phase5d_open_data_.clear();
+}
+
+void SignSession::Abort(const std::string& reason) {
+  if (IsTerminal()) {
+    return;
+  }
+  ClearSensitiveIntermediates();
+  Session::Abort(reason);
+}
+
+void SignSession::Complete() {
+  if (IsTerminal()) {
+    return;
+  }
+  ClearSensitiveIntermediates();
+  Session::Complete();
 }
 
 uint32_t SignSession::MessageTypeForPhase5Stage(SignPhase5Stage stage) {

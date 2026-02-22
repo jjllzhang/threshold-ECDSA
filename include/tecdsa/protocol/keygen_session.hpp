@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -76,6 +77,8 @@ class KeygenSession : public Session {
 
   bool HasResult() const;
   const KeygenResult& result() const;
+  bool PollTimeout(std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now());
 
   static uint32_t MessageTypeForPhase(KeygenPhase phase);
   static uint32_t Phase2ShareMessageType();
@@ -105,6 +108,9 @@ class KeygenSession : public Session {
   void MaybeAdvanceAfterPhase2();
   void MaybeAdvanceAfterPhase3();
   void ComputePhase2Aggregates();
+  void ClearSensitiveIntermediates();
+  void Abort(const std::string& reason);
+  void Complete();
   SchnorrProof BuildSchnorrProof(const ECPoint& statement, const Scalar& witness) const;
   bool VerifySchnorrProof(PartyIndex prover_id,
                           const ECPoint& statement,
