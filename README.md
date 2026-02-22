@@ -12,6 +12,7 @@
 - 网络抽象：`ITransport` + `InMemoryTransport` + `SessionRouter`
 - 阈值密钥生成（Keygen）：3 阶段广播/点对点混合流程
 - 阈值签名（Sign）：Phase1~Phase5E 全流程状态机
+- Phase2 并行化：线程池并行处理 MtA/MtAwc 子实例初始化（A1 证明构造）
 
 ## 当前实现进度（按测试里程碑）
 
@@ -39,6 +40,7 @@
   - Phase5D 篡改导致失败
   - Phase2 instance id 不一致触发中止
   - Phase4/Phase5B 的 ZK proof 篡改触发中止
+  - M9 对抗场景：错 commitment / 错 `δ_i` / 错 `Γ_i` / 错 `V_i` 触发中止且无结果泄露
 
 ## 协议流程摘要
 
@@ -104,6 +106,7 @@ ctest --test-dir build --output-on-failure
 ./build/m2_tests
 ./build/m3_tests
 ./build/m4_tests
+./build/m9_bench --n 5 --t 2 --keygen-iters 1 --sign-iters 20
 ```
 
 ## 使用边界与注意事项

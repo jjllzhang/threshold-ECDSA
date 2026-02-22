@@ -4,11 +4,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <future>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,6 +23,7 @@ extern "C" {
 #include "tecdsa/crypto/encoding.hpp"
 #include "tecdsa/crypto/random.hpp"
 #include "tecdsa/crypto/transcript.hpp"
+#include "tecdsa/common/thread_pool.hpp"
 
 namespace tecdsa {
 namespace {
@@ -364,6 +368,25 @@ const Bytes& CurveNameBytes() {
 const Bytes& ModulusQBytes() {
   static const Bytes kQBytes = ExportFixedWidth(Scalar::ModulusQ(), 32);
   return kQBytes;
+}
+
+size_t ResolvePhase2WorkerCount() {
+  const char* env = std::getenv("TECDSA_PHASE2_THREADS");
+  if (env != nullptr && env[0] != '\0') {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(env, &end, 10);
+    if (end != env && end != nullptr && *end == '\0' && parsed > 0) {
+      return static_cast<size_t>(parsed);
+    }
+  }
+
+  const unsigned int hw = std::thread::hardware_concurrency();
+  return std::max<size_t>(1, hw == 0 ? 1 : hw);
+}
+
+ThreadPool& Phase2ThreadPool() {
+  static ThreadPool pool(ResolvePhase2WorkerCount());
+  return pool;
 }
 
 void AppendCommonMtaTranscriptFields(Transcript* transcript,
@@ -2253,69 +2276,115 @@ void SignSession::InitializePhase2InstancesIfNeeded() {
   }
 
   PreparePhase1SecretsIfNeeded();
-  phase2_instances_initialized_ = true;
+
+  const auto self_pk_it = all_paillier_public_.find(self_id());
+  if (self_pk_it == all_paillier_public_.end()) {
+    throw std::logic_error("missing local Paillier or peer auxiliary parameters for phase2 init");
+  }
+  const mpz_class local_n = self_pk_it->second.n;
+  const mpz_class local_k_value = local_k_i_.value();
+  const Bytes session_id_bytes = session_id();
+  const PartyIndex initiator_id = self_id();
+
+  struct PendingInit {
+    PartyIndex peer = 0;
+    MtaType type = MtaType::kTimesGamma;
+    Bytes instance_id;
+    mpz_class c1;
+    mpz_class c1_randomness;
+    AuxRsaParams peer_aux;
+  };
+
+  std::vector<PendingInit> pending;
+  pending.reserve(peers_.size() * 2);
+  std::unordered_set<std::string> reserved_instance_keys;
+  reserved_instance_keys.reserve(peers_.size() * 2);
 
   for (PartyIndex peer : participants_) {
     if (peer == self_id()) {
       continue;
     }
 
+    const auto peer_aux_it = all_aux_rsa_params_.find(peer);
+    if (peer_aux_it == all_aux_rsa_params_.end()) {
+      throw std::logic_error("missing local Paillier or peer auxiliary parameters for phase2 init");
+    }
+
     for (MtaType type : {MtaType::kTimesGamma, MtaType::kTimesW}) {
       Bytes instance_id = RandomMtaInstanceId();
       std::string instance_key = BytesToKey(instance_id);
-      while (phase2_initiator_instances_.contains(instance_key)) {
+      while (phase2_initiator_instances_.contains(instance_key) ||
+             reserved_instance_keys.contains(instance_key)) {
         instance_id = RandomMtaInstanceId();
         instance_key = BytesToKey(instance_id);
       }
+      reserved_instance_keys.insert(instance_key);
 
-      const PaillierCiphertextWithRandom encrypted = local_paillier_->EncryptWithRandom(local_k_i_.value());
-      const mpz_class c1 = encrypted.ciphertext;
-      const mpz_class c1_randomness = encrypted.randomness;
-      phase2_initiator_instances_.emplace(
-          instance_key,
-          Phase2InitiatorInstance{
-              .responder = peer,
-              .type = type,
-              .instance_id = instance_id,
-              .c1 = c1,
-              .c1_randomness = c1_randomness,
-              .response_received = false,
-          });
-
-      const auto self_pk_it = all_paillier_public_.find(self_id());
-      const auto peer_aux_it = all_aux_rsa_params_.find(peer);
-      if (self_pk_it == all_paillier_public_.end() || peer_aux_it == all_aux_rsa_params_.end()) {
-        throw std::logic_error("missing local Paillier or peer auxiliary parameters for phase2 init");
-      }
-      const MtaProofContext proof_ctx{
-          .session_id = session_id(),
-          .initiator_id = self_id(),
-          .responder_id = peer,
-          .mta_instance_id = instance_id,
-      };
-      const A1RangeProof a1_proof =
-          ProveA1Range(proof_ctx,
-                       self_pk_it->second.n,
-                       peer_aux_it->second,
-                       c1,
-                       local_k_i_.value(),
-                       c1_randomness);
-
-      Bytes payload;
-      AppendU32Be(static_cast<uint32_t>(type), &payload);
-      AppendSizedField(instance_id, &payload);
-      AppendMpzField(c1, &payload);
-      AppendA1RangeProof(a1_proof, &payload);
-
-      Envelope out;
-      out.session_id = session_id();
-      out.from = self_id();
-      out.to = peer;
-      out.type = MessageTypeForPhase(SignPhase::kPhase2);
-      out.payload = std::move(payload);
-      phase2_outbox_.push_back(std::move(out));
+      const PaillierCiphertextWithRandom encrypted = local_paillier_->EncryptWithRandom(local_k_value);
+      pending.push_back(PendingInit{
+          .peer = peer,
+          .type = type,
+          .instance_id = instance_id,
+          .c1 = encrypted.ciphertext,
+          .c1_randomness = encrypted.randomness,
+          .peer_aux = peer_aux_it->second,
+      });
     }
   }
+
+  ThreadPool& pool = Phase2ThreadPool();
+  std::vector<std::future<Bytes>> payload_futures;
+  payload_futures.reserve(pending.size());
+  for (const PendingInit& init : pending) {
+    payload_futures.push_back(pool.Submit([init, local_n, local_k_value, session_id_bytes, initiator_id]() {
+      const MtaProofContext proof_ctx{
+          .session_id = session_id_bytes,
+          .initiator_id = initiator_id,
+          .responder_id = init.peer,
+          .mta_instance_id = init.instance_id,
+      };
+      const A1RangeProof a1_proof = ProveA1Range(
+          proof_ctx, local_n, init.peer_aux, init.c1, local_k_value, init.c1_randomness);
+
+      Bytes payload;
+      AppendU32Be(static_cast<uint32_t>(init.type), &payload);
+      AppendSizedField(init.instance_id, &payload);
+      AppendMpzField(init.c1, &payload);
+      AppendA1RangeProof(a1_proof, &payload);
+      return payload;
+    }));
+  }
+
+  std::vector<Bytes> payloads;
+  payloads.reserve(payload_futures.size());
+  for (std::future<Bytes>& future : payload_futures) {
+    payloads.push_back(future.get());
+  }
+
+  for (size_t i = 0; i < pending.size(); ++i) {
+    const PendingInit& init = pending[i];
+    const std::string instance_key = BytesToKey(init.instance_id);
+    phase2_initiator_instances_.emplace(
+        instance_key,
+        Phase2InitiatorInstance{
+            .responder = init.peer,
+            .type = init.type,
+            .instance_id = init.instance_id,
+            .c1 = init.c1,
+            .c1_randomness = init.c1_randomness,
+            .response_received = false,
+        });
+
+    Envelope out;
+    out.session_id = session_id();
+    out.from = self_id();
+    out.to = init.peer;
+    out.type = MessageTypeForPhase(SignPhase::kPhase2);
+    out.payload = std::move(payloads[i]);
+    phase2_outbox_.push_back(std::move(out));
+  }
+
+  phase2_instances_initialized_ = true;
 }
 
 void SignSession::MaybeFinalizePhase2AndAdvance() {

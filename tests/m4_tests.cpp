@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -413,8 +415,8 @@ void EnsureAllSessionsInPhase(const std::vector<std::unique_ptr<SignSession>>& s
   }
 }
 
-void RunToPhase5B(std::vector<std::unique_ptr<SignSession>>* sessions,
-                  const std::vector<PartyIndex>& signers) {
+void RunToPhase4(std::vector<std::unique_ptr<SignSession>>* sessions,
+                 const std::vector<PartyIndex>& signers) {
   DeliverSignEnvelopesOrThrow(CollectPhase1Messages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase2);
 
@@ -440,10 +442,19 @@ void RunToPhase5B(std::vector<std::unique_ptr<SignSession>>* sessions,
 
   DeliverSignEnvelopesOrThrow(CollectPhase3Messages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase4);
+}
+
+void RunToPhase5A(std::vector<std::unique_ptr<SignSession>>* sessions,
+                  const std::vector<PartyIndex>& signers) {
+  RunToPhase4(sessions, signers);
 
   DeliverSignEnvelopesOrThrow(CollectPhase4Messages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5A);
+}
 
+void RunToPhase5B(std::vector<std::unique_ptr<SignSession>>* sessions,
+                  const std::vector<PartyIndex>& signers) {
+  RunToPhase5A(sessions, signers);
   DeliverSignEnvelopesOrThrow(CollectPhase5AMessages(sessions), signers, sessions);
   EnsureAllSessionsInPhase(*sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5B);
 }
@@ -491,6 +502,26 @@ bool TamperPhase5BSchnorrProof(Envelope* envelope) {
   offset += kPointLen;  // Schnorr A
 
   envelope->payload[offset + kScalarLen - 1] ^= 0x01;  // Schnorr z
+  return true;
+}
+
+bool ReplacePhase4GammaPoint(Envelope* envelope, std::span<const uint8_t> replacement_point) {
+  constexpr size_t kPointLen = 33;
+  if (envelope == nullptr || replacement_point.size() != kPointLen ||
+      envelope->payload.size() < kPointLen) {
+    return false;
+  }
+  std::copy(replacement_point.begin(), replacement_point.end(), envelope->payload.begin());
+  return true;
+}
+
+bool ReplacePhase5BVPoint(Envelope* envelope, std::span<const uint8_t> replacement_point) {
+  constexpr size_t kPointLen = 33;
+  if (envelope == nullptr || replacement_point.size() != kPointLen ||
+      envelope->payload.size() < kPointLen) {
+    return false;
+  }
+  std::copy(replacement_point.begin(), replacement_point.end(), envelope->payload.begin());
   return true;
 }
 
@@ -856,6 +887,191 @@ void TestM6TamperedPhase5BVRelationAbortsReceiver() {
   }
 }
 
+void TestM9TamperedPhase4GammaPointAbortsReceiver() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xDA, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xEA, 0x02, 0x01});
+
+  RunToPhase4(&sessions, signers);
+
+  std::vector<Envelope> phase4_messages = CollectPhase4Messages(&sessions);
+  Bytes replacement_gamma;
+  for (const Envelope& envelope : phase4_messages) {
+    if (envelope.from == 2 && envelope.payload.size() >= 33) {
+      replacement_gamma.assign(envelope.payload.begin(), envelope.payload.begin() + 33);
+      break;
+    }
+  }
+  Expect(!replacement_gamma.empty(), "Test setup failed to capture replacement Gamma_i point");
+
+  bool tampered = false;
+  for (Envelope& envelope : phase4_messages) {
+    if (envelope.from == 1) {
+      tampered = ReplacePhase4GammaPoint(&envelope, replacement_gamma);
+      if (tampered) {
+        break;
+      }
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase4 Gamma_i payload to tamper");
+
+  for (const Envelope& envelope : phase4_messages) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Receiver must abort when phase4 Gamma_i is inconsistent");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Tampered Gamma_i path must not expose signature result");
+  }
+}
+
+void TestM9TamperedPhase5ACommitmentAbortsReceiver() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xDB, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xEB, 0x02, 0x01});
+
+  RunToPhase5A(&sessions, signers);
+
+  std::vector<Envelope> phase5a_messages = CollectPhase5AMessages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase5a_messages) {
+    if (envelope.from == 1 && !envelope.payload.empty()) {
+      envelope.payload[0] ^= 0x01;
+      tampered = true;
+      break;
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase5A commitment payload to tamper");
+
+  DeliverSignEnvelopesOrThrow(phase5a_messages, signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5B);
+
+  for (const Envelope& envelope : CollectPhase5BMessages(&sessions)) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Receiver must abort when phase5A commitment is tampered");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Tampered phase5A commitment path must not expose signature result");
+  }
+}
+
+void TestM9TamperedPhase3DeltaShareAbortsAndNoResult() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xDC, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xEC, 0x02, 0x01});
+
+  DeliverSignEnvelopesOrThrow(CollectPhase1Messages(&sessions), signers, &sessions);
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase2);
+
+  for (size_t round = 0; round < 32; ++round) {
+    const std::vector<Envelope> phase2_messages = CollectPhase2Messages(&sessions);
+    if (phase2_messages.empty()) {
+      throw std::runtime_error("phase2 stalled before MtA/MtAwc completion");
+    }
+    DeliverSignEnvelopesOrThrow(phase2_messages, signers, &sessions);
+
+    bool all_phase3 = true;
+    for (const auto& session : sessions) {
+      if (session->phase() != SignPhase::kPhase3) {
+        all_phase3 = false;
+        break;
+      }
+    }
+    if (all_phase3) {
+      break;
+    }
+  }
+  EnsureAllSessionsInPhase(sessions, SignPhase::kPhase3);
+
+  std::vector<Envelope> phase3_messages = CollectPhase3Messages(&sessions);
+  bool tampered = false;
+  for (Envelope& envelope : phase3_messages) {
+    if (envelope.from != 1 || envelope.payload.size() != 32) {
+      continue;
+    }
+    const Scalar parsed = Scalar::FromCanonicalBytes(envelope.payload);
+    const Scalar tampered_delta = parsed + Scalar::FromUint64(1);
+    const auto encoded = tampered_delta.ToCanonicalBytes();
+    envelope.payload.assign(encoded.begin(), encoded.end());
+    tampered = true;
+    break;
+  }
+  Expect(tampered, "Test setup failed to locate phase3 delta share to tamper");
+
+  for (const Envelope& envelope : phase3_messages) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  try {
+    EnsureAllSessionsInPhase(sessions, SignPhase::kPhase4);
+    DeliverSignEnvelopesOrThrow(CollectPhase4Messages(&sessions), signers, &sessions);
+    EnsureAllSessionsInPhase(sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5A);
+    DeliverSignEnvelopesOrThrow(CollectPhase5AMessages(&sessions), signers, &sessions);
+    EnsureAllSessionsInPhase(sessions, SignPhase::kPhase5, SignPhase5Stage::kPhase5B);
+    DeliverSignEnvelopesOrThrow(CollectPhase5BMessages(&sessions), signers, &sessions);
+  } catch (const std::exception&) {
+    // Failure during adversarial progression is expected.
+  }
+
+  bool any_aborted = false;
+  for (const auto& session : sessions) {
+    if (session->status() == SessionStatus::kAborted) {
+      any_aborted = true;
+    }
+    Expect(!session->HasResult(), "Tampered delta path must not expose signature result");
+  }
+  Expect(any_aborted, "At least one party must abort when phase3 delta share is tampered");
+}
+
+void TestM9TamperedPhase5BVPointAbortsReceiver() {
+  const auto keygen_results = RunKeygenAndCollectResults(/*n=*/3, /*t=*/1, Bytes{0xDD, 0x03, 0x01});
+  const std::vector<PartyIndex> signers = {1, 2};
+  const SignFixture fixture = BuildSignFixture(signers);
+  auto sessions = BuildSignSessions(fixture, keygen_results, Bytes{0xED, 0x02, 0x01});
+
+  RunToPhase5B(&sessions, signers);
+
+  std::vector<Envelope> phase5b_messages = CollectPhase5BMessages(&sessions);
+  Bytes replacement_v;
+  for (const Envelope& envelope : phase5b_messages) {
+    if (envelope.from == 2 && envelope.payload.size() >= 33) {
+      replacement_v.assign(envelope.payload.begin(), envelope.payload.begin() + 33);
+      break;
+    }
+  }
+  Expect(!replacement_v.empty(), "Test setup failed to capture replacement V_i point");
+
+  bool tampered = false;
+  for (Envelope& envelope : phase5b_messages) {
+    if (envelope.from == 1) {
+      tampered = ReplacePhase5BVPoint(&envelope, replacement_v);
+      if (tampered) {
+        break;
+      }
+    }
+  }
+  Expect(tampered, "Test setup failed to locate phase5B V_i payload to tamper");
+
+  for (const Envelope& envelope : phase5b_messages) {
+    (void)DeliverSignEnvelope(envelope, signers, &sessions);
+  }
+
+  const size_t receiver_idx = FindPartyIndexOrThrow(signers, 2);
+  Expect(sessions[receiver_idx]->status() == SessionStatus::kAborted,
+         "Receiver must abort when phase5B V_i is tampered");
+  for (const auto& session : sessions) {
+    Expect(!session->HasResult(), "Tampered V_i path must not expose signature result");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -869,11 +1085,15 @@ int main() {
     TestM6TamperedPhase4GammaSchnorrAbortsReceiver();
     TestM6TamperedPhase5BASchnorrAbortsReceiver();
     TestM6TamperedPhase5BVRelationAbortsReceiver();
+    TestM9TamperedPhase4GammaPointAbortsReceiver();
+    TestM9TamperedPhase5ACommitmentAbortsReceiver();
+    TestM9TamperedPhase3DeltaShareAbortsAndNoResult();
+    TestM9TamperedPhase5BVPointAbortsReceiver();
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << '\n';
     return 1;
   }
 
-  std::cout << "M4/M5/M6/M7 tests passed" << '\n';
+  std::cout << "M4/M5/M6/M7/M9 tests passed" << '\n';
   return 0;
 }
