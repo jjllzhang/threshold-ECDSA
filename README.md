@@ -1,71 +1,44 @@
 # threshold_ecdsa
 
-`threshold_ecdsa` 是一个基于 C++20 的 GG2019 阈值 ECDSA 实验性实现，目标是把多方密钥生成与多方签名流程拆解为可测试的状态机模块。项目当前重点是协议流程正确性与消息校验，而不是生产级部署。
+Research artifact for a C++20 implementation of the GG2019 threshold ECDSA protocol.
 
-## 项目能力概览
+## Paper Reference
 
-- 曲线与标量运算：基于 `libsecp256k1` 封装 `Scalar` / `ECPoint`
-- Paillier 同态加密：基于 `libhcs` 封装 `PaillierProvider`
-- 密码学基础组件：SHA-256/SHA-512、承诺、转录挑战、定长/变长编码
-- STRICT 证明模块：square-free/aux 参数证明接口与 strict/dev 门禁
-- 协议会话框架：统一 `Session` 生命周期（运行、完成、中止、超时）
-- 网络抽象：`ITransport` + `InMemoryTransport` + `SessionRouter`
-- 阈值密钥生成（Keygen）：3 阶段广播/点对点混合流程
-- 阈值签名（Sign）：Phase1~Phase5E 全流程状态机
-- Phase2 并行化：线程池并行处理 MtA/MtAwc 子实例初始化（A1 证明构造）
+- Rosario Gennaro, Steven Goldfeder.  
+  *Fast Multiparty Threshold ECDSA with Fast Trustless Setup* (CCS 2019).
 
-## 当前实现进度（按测试里程碑）
+This repository implements protocol components as executable state machines and emphasizes:
 
-- `crypto_primitives_tests`：基础密码学与编码组件
-  - 大整数/标量/点编码
-  - 点运算一致性
-  - 哈希、承诺、随机数
-  - Envelope 编解码
-  - Paillier 加解密与同态性质
-- `protocol_infrastructure_tests`：协议框架与网络骨架
-  - In-memory 传输
-  - SessionRouter 过滤与分发
-  - Keygen/Sign 骨架推进与超时处理
-  - strict/dev 缺 proof 行为分流
-- `keygen_flow_tests`：Keygen 完整流程
-  - `n=3,t=1` 与 `n=5,t=2` 一致性
-  - Feldman share 校验
-  - Schnorr 证明校验
-  - Paillier 公钥约束 `N > q^8`
-  - Phase1 的 square-free/aux proof strict 门禁校验
-  - 篡改消息触发中止
-- `sign_flow_tests`：Sign 完整流程与故障路径
-  - 端到端生成并验证 `(r,s)`
-  - Phase2 附录 A 证明（A.1/A.2/A.3）校验
-  - Phase5D 篡改导致失败
-  - Phase2 instance id 不一致触发中止
-  - Phase4/Phase5B 的 ZK proof 篡改触发中止
-  - 对抗场景：错 commitment / 错 `δ_i` / 错 `Γ_i` / 错 `V_i` 触发中止且无结果泄露
+- protocol-correct message flow,
+- strict input validation and abort behavior,
+- reproducible tests and benchmarks.
 
-## 协议流程摘要
+It is not a production-ready wallet/signing service.
 
-### Keygen（`KeygenSession`）
+## Scope of This Artifact
 
-1. Phase1：广播 `commit(Y_i)` 与 Paillier 公钥  
-2. Phase2：广播 open + Feldman 承诺，点对点发送 share  
-3. Phase3：广播 `X_i = g^{x_i}` 与 Schnorr 证明  
-4. 完成：聚合得到本地私钥份额 `x_i`、群公钥 `y`、全体 `X_i` 与 Paillier 公钥集合
+### Implemented Components
 
-### Sign（`SignSession`）
+- Elliptic-curve scalar/point operations (`libsecp256k1`-backed wrappers).
+- Paillier encryption wrapper (`libhcs`-backed).
+- Hashing, commitments, transcript/challenge utilities, wire encoding.
+- Session model with lifecycle management (`running/completed/aborted/timed-out`).
+- In-memory transport and session routing.
+- Threshold key generation (`KeygenSession`, 3 phases).
+- Threshold signing (`SignSession`, Phase1 to Phase5E).
+- Strict/dev gating for square-free and auxiliary-parameter proof artifacts.
 
-1. Phase1：提交 `Gamma_i` 承诺  
-2. Phase2：双向 MtA / MtAwc + 附录A证明（A.1/A.2/A.3）交互，得到 `delta_i`、`sigma_i` 相关份额  
-3. Phase3：广播 `delta_i` 并聚合求逆  
-4. Phase4：打开 `Gamma_i` + Schnorr 证明，计算 `R` 与 `r`  
-5. Phase5A~5E：两轮承诺-打开（含 `A_i` Schnorr 与 `V_i=R^{s_i}g^{l_i}` 关系证明）与 `s_i` 揭示，最终聚合并本地验证 ECDSA 签名
+### Current Engineering Goal
 
-## 代码结构
+The repository targets protocol engineering reproducibility, not hardened deployment.
+
+## Repository Layout
 
 ```text
 include/tecdsa/
-  crypto/      # 标量、点、Paillier、哈希、承诺、编码、转录
-  net/         # Envelope、传输接口、内存网络
-  protocol/    # Session、Router、KeygenSession、SignSession
+  crypto/      # Scalar/ECPoint/Paillier/hash/commitment/encoding/transcript/proofs
+  net/         # Envelope, transport interfaces, in-memory network
+  protocol/    # Session base, router, keygen/sign state machines
 src/
   crypto/
   net/
@@ -75,55 +48,105 @@ tests/
   protocol_infrastructure_tests.cpp
   keygen_flow_tests.cpp
   sign_flow_tests.cpp
+bench/
+  protocol_flow_bench.cpp
 third_party/
   secp256k1/
   libhcs/
 ```
 
-## 依赖
+## Reproducibility
+
+### Requirements
 
 - CMake >= 3.22
-- 支持 C++20 的编译器（clang++/g++）
-- GMP / gmpxx（链接 `gmp`, `gmpxx`）
+- C++20 compiler (`clang++`/`g++`)
+- GMP / gmpxx
 - OpenSSL `libcrypto`
-- 子模块：
+- Git submodules:
   - `third_party/secp256k1`
   - `third_party/libhcs`
 
-## 构建与测试
+### Build
 
 ```bash
 git submodule update --init --recursive
 cmake -S . -B build
 cmake --build build -j
+```
+
+### Test Suite
+
+Run all tests:
+
+```bash
 ctest --test-dir build --output-on-failure
 ```
 
-也可以直接运行单项测试：
+Run individual executables:
 
 ```bash
 ./build/crypto_primitives_tests
 ./build/protocol_infrastructure_tests
 ./build/keygen_flow_tests
 ./build/sign_flow_tests
+```
+
+### Test Coverage Summary
+
+- `crypto_primitives_tests`: basic crypto primitives and wire format checks.
+- `protocol_infrastructure_tests`: transport/router/session skeleton behavior.
+- `keygen_flow_tests`: end-to-end keygen, strict gating, and adversarial tampering.
+- `sign_flow_tests`: end-to-end signing, proof checks, and adversarial failure paths.
+
+## Protocol Flow (Implemented)
+
+### Keygen (`KeygenSession`)
+
+1. Phase1: broadcast commitment + Paillier public parameters.
+2. Phase2: broadcast opens/commitments and send shares point-to-point.
+3. Phase3: broadcast `X_i = g^{x_i}` with Schnorr proof.
+4. Finalization: aggregate `x_i`, `y`, all `X_i`, and Paillier/public proof artifacts.
+
+### Sign (`SignSession`)
+
+1. Phase1: commit to `Gamma_i`.
+2. Phase2: MtA/MtAwc interaction with Appendix-A style proof checks.
+3. Phase3: broadcast `delta_i` and aggregate inversion path.
+4. Phase4: open `Gamma_i`, verify proof, derive `R` and `r`.
+5. Phase5A~5E: commit/open rounds with relation proofs, then finalize `(r, s)`.
+
+## Benchmarking
+
+Run:
+
+```bash
 ./build/protocol_flow_bench --n 5 --t 2 --keygen-iters 1 --sign-iters 20
 ```
 
-`protocol_flow_bench` 输出包含两类统计：
-- Keygen/Sign 各 phase 的平均耗时与总带宽。
-- strict-proof 归因拆分（aux/square-free/A.1-A.3/Phase4 Schnorr/Phase5B 证明）的平均耗时与带宽。
+Arguments:
 
-## 经典 Benchmark 结果（2026-02-23）
+- `--n`: total parties
+- `--t`: threshold (`t < n`)
+- `--keygen-iters`: keygen benchmark iterations
+- `--sign-iters`: signing benchmark iterations
+- `--paillier-bits`: Paillier modulus bits (`>= 2048`)
 
-已执行一组常见阈值配置，并将原始输出与汇总保存到：
-`bench/results/classic_20260223_000650`
+Output sections:
 
-主要结果文件：
+- `[Keygen]`: per-phase average latency and bytes.
+- `[Sign]`: per-phase average latency and bytes.
+- `[Strict-Proof Attribution]`: proof-related byte/time attribution.
+
+## Published Baseline Results (2026-02-23)
+
+Raw and summarized artifacts are stored in:
+
 - `bench/results/classic_20260223_000650/index.md`
 - `bench/results/classic_20260223_000650/summary.csv`
 - `bench/results/classic_20260223_000650/summary.md`
 
-配置与耗时摘要（elapsed wall-clock）：
+Reported wall-clock summary:
 
 | case | n/t | paillier | keygen_iters | sign_iters | elapsed_sec | keygen_strict_ratio% | sign_strict_ratio% |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -132,7 +155,7 @@ ctest --test-dir build --output-on-failure
 | n5_t2_p2048_k2_s20 | 5/2 | 2048 | 2 | 20 | 67.21 | 86.74 | 78.38 |
 | n5_t2_p3072_k1_s10 | 5/2 | 3072 | 1 | 10 | 80.09 | 89.20 | 75.17 |
 
-复现这些结果可直接运行：
+Reproduction commands:
 
 ```bash
 ./build/protocol_flow_bench --n 2 --t 1 --paillier-bits 2048 --keygen-iters 3 --sign-iters 20
@@ -141,8 +164,8 @@ ctest --test-dir build --output-on-failure
 ./build/protocol_flow_bench --n 5 --t 2 --paillier-bits 3072 --keygen-iters 1 --sign-iters 10
 ```
 
-## 使用边界与注意事项
+## Limitations
 
-- 当前网络层仅有内存传输实现，未包含真实网络协议、鉴权、重传或持久化。
-- 代码主要面向研究与工程分层验证，未经过生产安全审计。
-- 若用于真实系统，需要补齐传输安全、密钥托管、审计日志、对抗性测试与性能优化。
+- Network layer is in-memory only (no real transport security/retransmission/persistence).
+- No claim of production security hardening.
+- Intended for protocol implementation study, testing, and benchmarking.
