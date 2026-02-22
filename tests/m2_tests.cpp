@@ -102,21 +102,37 @@ void TestSessionRouterFiltering() {
 }
 
 void TestKeygenSessionSkeleton() {
-  KeygenSessionConfig cfg;
-  cfg.session_id = {1, 1, 1};
-  cfg.self_id = 1;
-  cfg.participants = {1, 2, 3};
-  cfg.timeout = std::chrono::seconds(5);
+  KeygenSessionConfig self_cfg;
+  self_cfg.session_id = {1, 1, 1};
+  self_cfg.self_id = 1;
+  self_cfg.participants = {1, 2, 3};
+  self_cfg.threshold = 1;
+  self_cfg.timeout = std::chrono::seconds(5);
 
-  KeygenSession session(std::move(cfg));
+  KeygenSessionConfig peer2_cfg;
+  peer2_cfg.session_id = {1, 1, 1};
+  peer2_cfg.self_id = 2;
+  peer2_cfg.participants = {1, 2, 3};
+  peer2_cfg.threshold = 1;
+  peer2_cfg.timeout = std::chrono::seconds(5);
+
+  KeygenSessionConfig peer3_cfg;
+  peer3_cfg.session_id = {1, 1, 1};
+  peer3_cfg.self_id = 3;
+  peer3_cfg.participants = {1, 2, 3};
+  peer3_cfg.threshold = 1;
+  peer3_cfg.timeout = std::chrono::seconds(5);
+
+  KeygenSession session(std::move(self_cfg));
+  KeygenSession peer2(std::move(peer2_cfg));
+  KeygenSession peer3(std::move(peer3_cfg));
   Expect(session.phase() == KeygenPhase::kPhase1, "Keygen starts at phase1");
 
-  const uint32_t phase1_type = KeygenSession::MessageTypeForPhase(KeygenPhase::kPhase1);
-  Expect(session.HandleEnvelope(MakeEnvelope({1, 1, 1}, phase1_type, 2)),
+  Expect(session.HandleEnvelope(peer2.BuildPhase1CommitEnvelope()),
          "Keygen should accept phase1 msg from peer2");
   Expect(session.received_peer_count_in_phase() == 1, "Peer count in phase should increase");
 
-  Expect(session.HandleEnvelope(MakeEnvelope({1, 1, 1}, phase1_type, 3)),
+  Expect(session.HandleEnvelope(peer3.BuildPhase1CommitEnvelope()),
          "Keygen should accept phase1 msg from peer3");
   Expect(session.phase() == KeygenPhase::kPhase2, "Keygen advances to phase2 when all peers sent");
 
